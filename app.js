@@ -6,7 +6,7 @@ import { CLOSURES } from './data/closures.js';
 import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
 import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter, areaContains } from './lib/geo.js';
-import { rankTransit, walkMinutes } from './lib/transit.js';
+import { rankTransit, walkMinutes, applyArrivals, arrivalKey, firstRide, UNKNOWN_WAIT_MIN } from './lib/transit.js';
 
 const $ = (id) => document.getElementById(id);
 const HOURS = Array.from({ length: 18 }, (_, i) => i + 6); // 6시 ~ 23시
@@ -623,8 +623,12 @@ async function findTransit() {
     if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
     const levels = levelsAt(state.ymd, state.hour);
     const closureIds = activeClosures(CLOSURES, state.ymd, state.hour).map((c) => c.id);
+    const ranked = rankTransit(data.routes || [], levels, closureIds);
     state.transit = {
-      ranked: rankTransit(data.routes || [], levels, closureIds),
+      ranked,
+      baseRanked: ranked,
+      live: null, // 실시간 도착 정보 상태
+      isNow: isNowSelected(),
       message: data.message || null,
       landingURL: data.landingURL || null,
       levels,
@@ -636,6 +640,7 @@ async function findTransit() {
     };
     drawRoute();
     renderRouteResult();
+    if (state.transit.isNow) loadArrivals();
   } catch (e) {
     alertRoute(`버스 경로를 찾지 못했어요. ${e.message}`);
   } finally {
@@ -725,6 +730,64 @@ const busNames = (step) => {
   return names.length > 3 ? `${names.slice(0, 3).join('·')} 외` : names.join('·');
 };
 
+function isNowSelected() {
+  const now = kstNow();
+  return state.ymd === now.ymd && state.hour === clampHour(now.hour);
+}
+
+// 버스 실시간 도착 정보 불러오기 (경로마다 첫 정류장)
+async function loadArrivals() {
+  const t = state.transit;
+  if (!t?.baseRanked.length) return;
+  const stops = [];
+  const seen = new Set();
+  for (const r of t.baseRanked) {
+    const key = arrivalKey(r);
+    const s = firstRide(r);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    stops.push({ key, lat: s.coords[0][1], lng: s.coords[0][0], name: s.from, routes: s.vehicles.map((v) => v.name) });
+  }
+  t.live = { loading: true };
+  renderTransitResult();
+  try {
+    const r = await fetch('/api/arrivals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stops }),
+    });
+    const data = await r.json();
+    if (state.transit !== t) return; // 그사이 새로 검색했으면 무시
+    if (data.ok) {
+      t.ranked = applyArrivals(t.baseRanked, data.results || {});
+      t.selected = 0;
+    }
+    const now = new Date();
+    t.live = {
+      ok: Boolean(data.ok),
+      reason: data.reason || null,
+      at: `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`,
+    };
+  } catch (e) {
+    t.live = { ok: false, reason: `실시간 도착 정보를 받지 못했어요: ${e.message}` };
+  }
+  drawRoute();
+  renderTransitResult();
+}
+
+function liveLine(r) {
+  const L = r.live;
+  if (!L) return '';
+  const names = esc(busNames(firstRide(r)));
+  if (L.unavailable) {
+    return `<span class="arrive none">실시간: ${L.noStop ? '이 정류장을 도착 정보에서 찾지 못했어요' : '도착 정보를 받지 못했어요'}</span>`;
+  }
+  if (L.none) {
+    return `<span class="arrive none">실시간: 지금 오고 있는 ${names}번 버스가 없어요${L.missed ? ' (오는 버스는 정류장까지 걷는 동안 지나가요)' : ''}. 배차 간격이 길 수 있어서 ${UNKNOWN_WAIT_MIN}분 이상 기다린다고 보고 계산했어요.</span>`;
+  }
+  return `<span class="arrive">실시간: ${esc(L.routeNo)}번 ${L.minutes}분 후 도착${Number.isFinite(L.stopsAway) ? ` (${L.stopsAway}정류장 전)` : ''}, 정류장에서 ${L.wait}분 기다려요</span>`;
+}
+
 function renderTransitResult() {
   const box = $('routeResult');
   const t = state.transit;
@@ -742,9 +805,10 @@ function renderTransitResult() {
       const meta = [`환승 ${r.transfers}회`, `걷기 약 ${r.walkMin + r.steps.filter((s) => s.type === 'WALKING').reduce((a, s) => a + s.minutes, 0)}분`];
       if (r.fare) meta.push(`${r.fare.toLocaleString()}원`);
       parts.push(`<li><button type="button" class="troute" data-k="${k}" aria-pressed="${k === t.selected}">
-        <span class="thead"><span class="ttime">${r.total}분</span>${k === 0 ? '<span class="badge">추천</span>' : ''}<span class="tmeta">${meta.join(' · ')}</span></span>
+        <span class="thead"><span class="ttime">${r.live && !r.live.unavailable ? `${r.total + (r.wait || 0)}분` : `${r.total}분`}</span>${r.live && !r.live.unavailable ? '<span class="tmeta">기다림 포함</span>' : ''}${k === 0 ? '<span class="badge">추천</span>' : ''}<span class="tmeta">${meta.join(' · ')}</span></span>
         <span class="tchain">${chain}</span>
         ${ride[0]?.from ? `<span class="tstops">${esc(ride[0].from)} 승차 → ${esc(ride[ride.length - 1].to || '')} 하차</span>` : ''}
+        ${liveLine(r)}
         ${r.risks.length ? `<span class="risk">지나가는 혼잡 구역: ${r.risks.map((x) => esc(label(x))).join(', ')}. 막히면 ${r.delay}분쯤 늦어질 수 있어요.</span>` : ''}
       </button></li>`);
     });
@@ -754,6 +818,7 @@ function renderTransitResult() {
     const steps = [];
     const firstStop = sel.steps.find((s) => s.type !== 'WALKING')?.from;
     steps.push(`<li>${esc(firstStop || '첫 정류장')}까지 걷기<span>약 ${walkMinutes(sel.walkStartM)}분</span></li>`);
+    if (sel.live?.wait !== undefined) steps.push(`<li>정류장에서 기다리기<span>${sel.live.wait}분 (${esc(sel.live.routeNo)}번)</span></li>`);
     for (const s of sel.steps) {
       if (s.type === 'WALKING') {
         if (s.minutes > 0) steps.push(`<li>환승하러 걷기<span>${s.minutes}분</span></li>`);
@@ -766,12 +831,20 @@ function renderTransitResult() {
 
     const straight = distanceM([t.from.lat, t.from.lng], [t.to.lat, t.to.lng]);
     const walkOnly = walkMinutes(straight);
-    if (walkOnly <= t.ranked[0].total) {
+    if (walkOnly <= t.ranked[0].total + (t.ranked[0].wait || 0)) {
       parts.push(`<p class="avoided">걸어서 가면 약 ${walkOnly}분이라 걷는 게 더 빠를 수 있어요.</p>`);
     }
   }
 
-  parts.push(`<p class="why">버스 배차 간격과 실시간 도착 정보는 아직 반영되지 않았어요.${t.landingURL ? ` <a href="${esc(t.landingURL)}" target="_blank" rel="noopener">카카오맵에서 확인하기</a>` : ''}</p>`);
+  const kakaoLink = t.landingURL ? ` <a href="${esc(t.landingURL)}" target="_blank" rel="noopener">카카오맵에서 확인하기</a>` : '';
+  if (!t.isNow) {
+    parts.push(`<p class="why">실시간 도착 정보는 시간을 '지금'으로 두고 찾을 때만 보여요.${kakaoLink}</p>`);
+  } else if (t.live?.loading) {
+    parts.push('<p class="why">실시간 도착 정보 불러오는 중…</p>');
+  } else if (t.live) {
+    if (t.live.reason) parts.push(`<p class="warn">${esc(t.live.reason)}</p>`);
+    parts.push(`<p class="why">${t.live.ok ? `실시간 도착 정보는 ${esc(t.live.at)} 기준이에요.` : ''} <button type="button" class="chip" data-live-refresh>도착 정보 새로고침</button>${kakaoLink}</p>`);
+  }
   if (t.ymd !== state.ymd || t.hour !== state.hour) {
     parts.push(`<p class="warn">고른 시간이 바뀌었어요. 다시 찾으면 ${state.hour}시 혼잡도로 추천 순서를 다시 정해요.</p>`);
   }
@@ -783,6 +856,7 @@ function renderTransitResult() {
       renderTransitResult();
     }),
   );
+  box.querySelector('[data-live-refresh]')?.addEventListener('click', loadArrivals);
 }
 
 function renderRouteResult() {

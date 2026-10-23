@@ -7,7 +7,7 @@
 
 import { ZONES } from '../data/zones.js';
 import { CLOSURES } from '../data/closures.js';
-import { areaRing, areasOnPath, areaContains, areaCenter, distanceM } from '../lib/geo.js';
+import { areaRing, areasOnPath, areaContains, distanceM } from '../lib/geo.js';
 
 const GH_URL = 'https://graphhopper.com/api/1/route';
 
@@ -20,12 +20,16 @@ const AVOID_STRENGTH = {
 
 const AREAS = [...ZONES, ...CLOSURES];
 
-// 경유지 방식에서 경로 점수 매길 때, 구역을 지나가면 더하는 "벌점(분)"
-// 이 숫자가 클수록 시간이 더 걸려도 돌아가는 길을 골라요.
-const PASS_PENALTY_MIN = {
-  foot: { mid: 4, high: 12, peak: 25, closed: 8 },
-  car: { mid: 2, high: 6, peak: 12, closed: 60 },
+// 경유지 방식에서 경로 점수 매기기
+// 혼잡 구역 안을 지나는 동안은 "실제보다 몇 배 오래 걸리는 것처럼" 쳐요.
+// 예) 걸어서 매우 혼잡 4배: 구역 안을 2분 걸으면 6분 손해로 계산 → 모서리를 살짝 스치는 건 작은 손해
+const CROWD_COST = {
+  foot: { mid: 1.5, high: 2.5, peak: 4, closed: 2 },
+  car: { mid: 1.3, high: 1.8, peak: 2.5, closed: 30 },
 };
+// 돌아가는 길이 가장 짧은 길보다 이만큼 넘게 오래 걸리면 후보에서 빼요
+const MAX_EXTRA_RATIO = 1.5;
+const MAX_EXTRA_MIN = { foot: 12, car: 10 };
 const MAX_DETOUR_TRIES = 4; // 경유지 후보 몇 개까지 계산해 볼지 (하나당 GraphHopper 1회)
 
 // GraphHopper 구역 피하기(custom model)가 이 플랜에서 막혀 있으면 기억해 두고 다음부턴 바로 경유지 방식으로
@@ -70,83 +74,99 @@ function summarize(path) {
 }
 
 // ── 경유지 방식 ─────────────────────────────────────────
-// 1) 가장 짧은 길이 지나가는 혼잡 구역을 찾고
-// 2) 그 구역의 왼쪽·오른쪽 바깥에 경유지 후보를 잡아서
-// 3) 출발 → 경유지 → 도착 경로를 계산한 뒤
-// 4) (걸리는 시간 + 지나가는 구역 벌점)이 가장 작은 길을 골라요.
+// 1) 가장 짧은 길이 혼잡 구역에 들어가는 구간(들어가는 점·나오는 점)을 찾고
+// 2) 그 구간 바로 옆, 구역 바깥으로 비켜선 곳에 경유지를 잡아서
+// 3) 출발 → 경유지 → 도착 경로를 몇 개 더 계산한 뒤
+// 4) 너무 멀리 돌아가는 건 빼고, 혼잡 비용이 가장 작은 길을 골라요.
 
-function areaRadiusM(area) {
-  if (area.polygon?.length >= 3) {
-    const c = areaCenter(area);
-    return Math.max(...area.polygon.map((p) => distanceM(c, p)));
+const M_PER_DEG_LAT = 111320;
+
+// 경로가 각 구역 안을 지나는 거리(미터)
+function insideMeters(coords, area) {
+  let m = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const [lng1, lat1] = coords[i - 1];
+    const [lng2, lat2] = coords[i];
+    if (areaContains(area, [(lat1 + lat2) / 2, (lng1 + lng2) / 2])) m += distanceM([lat1, lng1], [lat2, lng2]);
   }
-  return area.radiusM;
+  return m;
 }
 
-// 장애물(구역) 옆으로 돌아가는 경유지 후보 만들기
-// 가는 방향 기준 왼쪽·오른쪽 각각: 옆으로 한 번 꺾는 길(경유지 1개) + 둥글게 감싸는 길(경유지 2개)
-const M_PER_DEG_LAT = 111320;
-function sideDetours(center, radiusM, avoidAreas, from, to) {
-  const [clat, clng] = center;
-  const mLng = M_PER_DEG_LAT * Math.cos((clat * Math.PI) / 180);
-  // 출발→도착 방향 (동쪽 x, 북쪽 y, 단위 벡터)
-  let dx = (to.lng - from.lng) * mLng;
-  let dy = (to.lat - from.lat) * M_PER_DEG_LAT;
+function routeCost(summary, avoidItems, profile) {
+  const speed = summary.distanceM / Math.max(1, summary.minutes); // 이 경로의 분당 이동 거리
+  let cost = summary.minutes;
+  for (const { area, level } of avoidItems) {
+    const m = insideMeters(summary.coords, area);
+    if (m > 0) cost += (m / speed) * ((CROWD_COST[profile][level] || 1) - 1);
+  }
+  return cost;
+}
+
+// p 지점에서 방향 (nx, ny)로 조금씩 나가면서 피할 구역을 벗어나는 첫 지점 + 여유 40m
+function stepOutside(p, nx, ny, avoidAreas) {
+  const mLng = M_PER_DEG_LAT * Math.cos((p[0] * Math.PI) / 180);
+  for (let d = 30; d <= 1500; d += 30) {
+    const q = [p[0] + (ny * d) / M_PER_DEG_LAT, p[1] + (nx * d) / mLng];
+    if (!avoidAreas.some((a) => areaContains(a, q))) {
+      const e = d + 40;
+      return [p[0] + (ny * e) / M_PER_DEG_LAT, p[1] + (nx * e) / mLng];
+    }
+  }
+  return null;
+}
+
+function nearDetours(coords, targets, avoidAreas) {
+  // 피할 구역 안에 있는 경로 점들 중 가장 긴 연속 구간
+  const inside = coords.map(([lng, lat]) => targets.some((a) => areaContains(a, [lat, lng])));
+  let best = null;
+  for (let i = 0; i < inside.length; i++) {
+    if (!inside[i]) continue;
+    let j = i;
+    while (j + 1 < inside.length && inside[j + 1]) j++;
+    if (!best || j - i > best[1] - best[0]) best = [i, j];
+    i = j;
+  }
+  if (!best) return [];
+  const [i0, i1] = best;
+  const entry = [coords[i0][1], coords[i0][0]];
+  const exit = [coords[i1][1], coords[i1][0]];
+  const mid = [coords[Math.floor((i0 + i1) / 2)][1], coords[Math.floor((i0 + i1) / 2)][0]];
+
+  // 들어가는 점 → 나오는 점 방향 (너무 짧으면 그 앞뒤 경로 방향)
+  const a = coords[Math.max(0, i0 - 3)];
+  const b = coords[Math.min(coords.length - 1, i1 + 3)];
+  const mLng = M_PER_DEG_LAT * Math.cos((mid[0] * Math.PI) / 180);
+  let dx = (b[0] - a[0]) * mLng;
+  let dy = (b[1] - a[1]) * M_PER_DEG_LAT;
   const len = Math.hypot(dx, dy) || 1;
   dx /= len; dy /= len;
-  const toLatLng = (x, y) => [clat + y / M_PER_DEG_LAT, clng + x / mLng];
-  const outside = (pt) => !avoidAreas.some((a) => areaContains(a, pt));
 
-  const result = [];
+  const out = [];
   for (const side of [1, -1]) {
     const nx = -dy * side;
     const ny = dx * side;
-    for (const scale of [1.3, 1.7]) {
-      const r = radiusM * scale + 60;
-      const single = toLatLng(nx * r, ny * r);
-      const ang = (35 * Math.PI) / 180;
-      const back = toLatLng((nx * Math.cos(ang) - dx * Math.sin(ang)) * r, (ny * Math.cos(ang) - dy * Math.sin(ang)) * r);
-      const front = toLatLng((nx * Math.cos(ang) + dx * Math.sin(ang)) * r, (ny * Math.cos(ang) + dy * Math.sin(ang)) * r);
-      if (outside(single) && outside(back) && outside(front)) {
-        result.push({ side, vias: [single] }, { side, vias: [back, front] });
-        break; // 이쪽 방향은 이 거리로 충분
-      }
-    }
+    const m = stepOutside(mid, nx, ny, avoidAreas);
+    if (m) out.push({ vias: [m] });
+    const e = stepOutside(entry, nx, ny, avoidAreas);
+    const x = stepOutside(exit, nx, ny, avoidAreas);
+    if (e && x) out.push({ vias: [e, x] });
   }
-  return result;
-}
-
-// 여러 구역을 한 덩어리로 봤을 때의 가운데와 반경 (붙어 있는 구역을 한 번에 돌아가기 위해)
-function clusterOf(areas) {
-  const centers = areas.map(areaCenter);
-  const c = [centers.reduce((s, p) => s + p[0], 0) / centers.length, centers.reduce((s, p) => s + p[1], 0) / centers.length];
-  const r = Math.max(...areas.map((a) => distanceM(c, areaCenter(a)) + areaRadiusM(a)));
-  return { center: c, radiusM: r };
-}
-
-function scorePath(summary, avoidLevels, profile) {
-  const penalty = summary.passes.reduce((sum, id) => sum + (PASS_PENALTY_MIN[profile][avoidLevels[id]] || 0), 0);
-  return summary.minutes + penalty;
+  return out;
 }
 
 async function detourRoute(key, base, plainSummary, avoidItems, profile, from, to) {
-  const avoidLevels = Object.fromEntries(avoidItems.map((x) => [x.area.id, x.level]));
-  const avoidAreas = avoidItems.map((x) => x.area);
-  // 출발지·도착지가 안에 있는 구역은 어차피 못 피하니 빼고, 붐비는 순서로
-  const order = ['closed', 'peak', 'high', 'mid'];
   const targets = avoidItems
     .filter((x) => plainSummary.passes.includes(x.area.id))
     .filter((x) => !areaContains(x.area, [from.lat, from.lng]) && !areaContains(x.area, [to.lat, to.lng]))
-    .sort((a, b) => order.indexOf(a.level) - order.indexOf(b.level));
+    .map((x) => x.area);
   if (!targets.length) return { smart: null, note: null };
 
-  // 피할 구역이 여러 개면 한 덩어리로 보고, 그 양옆으로 돌아가는 후보를 만들어요
-  const obstacle = targets.length > 1
-    ? clusterOf(targets.map((x) => x.area))
-    : { center: areaCenter(targets[0].area), radiusM: areaRadiusM(targets[0].area) };
-  const picks = sideDetours(obstacle.center, obstacle.radiusM, avoidAreas, from, to);
+  const avoidAreas = avoidItems
+    .map((x) => x.area)
+    .filter((a) => !areaContains(a, [from.lat, from.lng]) && !areaContains(a, [to.lat, to.lng]));
+  const picks = nearDetours(plainSummary.coords, targets, avoidAreas).slice(0, MAX_DETOUR_TRIES);
   const tries = await Promise.all(
-    picks.slice(0, MAX_DETOUR_TRIES).map((p) =>
+    picks.map((p) =>
       requestGraphHopper(key, {
         ...base,
         points: [[from.lng, from.lat], ...p.vias.map(([lat, lng]) => [lng, lat]), [to.lng, to.lat]],
@@ -154,15 +174,23 @@ async function detourRoute(key, base, plainSummary, avoidItems, profile, from, t
     ),
   );
 
-  let best = { summary: plainSummary, score: scorePath(plainSummary, avoidLevels, profile) };
+  const limit = Math.min(plainSummary.minutes * MAX_EXTRA_RATIO, plainSummary.minutes + MAX_EXTRA_MIN[profile]);
+  let best = { summary: plainSummary, cost: routeCost(plainSummary, avoidItems, profile) };
+  let tooFar = false;
   for (const t of tries) {
     if (!t.ok) continue;
     const summary = summarize(t.path);
-    const score = scorePath(summary, avoidLevels, profile);
-    if (score < best.score) best = { summary, score };
+    if (summary.minutes > Math.max(limit, plainSummary.minutes + 2)) { tooFar = true; continue; }
+    const cost = routeCost(summary, avoidItems, profile);
+    if (cost < best.cost - 0.5) best = { summary, cost };
   }
   if (best.summary === plainSummary) {
-    return { smart: null, note: '혼잡 구역을 돌아가는 길이 너무 멀어서 가장 짧은 길로 안내해요.' };
+    return {
+      smart: null,
+      note: tooFar
+        ? '혼잡 구역을 피하려면 너무 많이 돌아가야 해서 가장 짧은 길로 안내해요.'
+        : '가장 짧은 길이 혼잡 구역을 조금만 지나서 그대로 안내해요.',
+    };
   }
   return { smart: best.summary, note: null };
 }
