@@ -7,6 +7,7 @@ import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
 import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter, areaContains } from './lib/geo.js';
 import { rankTransit, walkMinutes, applyArrivals, arrivalKey, firstRide, UNKNOWN_WAIT_MIN } from './lib/transit.js';
+import { planFromPath, planFromTransit, navStatus, signArrow } from './lib/nav.js';
 
 const $ = (id) => document.getElementById(id);
 const HOURS = Array.from({ length: 18 }, (_, i) => i + 6); // 6시 ~ 23시
@@ -37,6 +38,8 @@ const state = {
   region: null, // 관광지 둘러보기에서 고른 권역
   place: null, // 고른 관광지 { ...PLACES 항목, pos: [위도, 경도] | null, loading }
   transit: null,
+  nav: null, // 길 안내 중일 때 상태
+  autoNav: false, // 다시 찾기 후 바로 안내 이어가기
 };
 
 let kakao = null;
@@ -169,6 +172,7 @@ function onShapeClick(e, zoneId) {
   lastShapeClick = Date.now();
   if ((state.pick || DRAW_MODE) && e?.latLng) return onPointClick(e.latLng);
   if (zoneId) selectZone(zoneId, false);
+  if (e?.latLng) popupAtPoint(e.latLng.getLat(), e.latLng.getLng());
 }
 
 function onPointClick(latLng) {
@@ -178,7 +182,89 @@ function onPointClick(latLng) {
     setPickMode(which); // 끄기
     return;
   }
-  if (DRAW_MODE) addDraftPoint(latLng.getLat(), latLng.getLng());
+  if (DRAW_MODE) return addDraftPoint(latLng.getLat(), latLng.getLng());
+  popupAtPoint(latLng.getLat(), latLng.getLng());
+}
+
+// ── 지도 위 팝업 ───────────────────────────────────────
+let popup = null;
+function closePopup() {
+  popup?.setMap(null);
+  popup = null;
+}
+
+// title: 글자, info: 이미 안전하게 만든 HTML, actions: [{ label, run }]
+function showPopup(lat, lng, title, info, actions) {
+  closePopup();
+  const el = document.createElement('div');
+  el.className = 'map-pop';
+  el.innerHTML = `<button type="button" class="pop-close" aria-label="닫기">×</button><strong class="pop-title"></strong><div class="pop-info">${info || ''}</div><div class="pop-actions"></div>`;
+  el.querySelector('.pop-title').textContent = title;
+  el.querySelector('.pop-close').addEventListener('click', closePopup);
+  for (const a of actions) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.textContent = a.label;
+    b.addEventListener('click', a.run);
+    el.querySelector('.pop-actions').append(b);
+  }
+  popup = new kakao.maps.CustomOverlay({ position: new kakao.maps.LatLng(lat, lng), content: el, yAnchor: 1.08, zIndex: 10, clickable: true });
+  popup.setMap(map);
+  return el;
+}
+
+function zoneBadge(lat, lng) {
+  const zone = ZONES.find((z) => areaContains(z, [lat, lng]));
+  if (!zone) return { zone: null, html: '' };
+  const r = scoreZone(zone, state.ymd, state.hour, state.forecast);
+  return { zone, html: `<span class="zone-level ${r.level.key}">${state.hour}시 ${esc(r.level.label)}</span> <span>${esc(zone.name)} 구역</span>` };
+}
+
+function scrollToCard(id) {
+  $(id).scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// 빈 곳을 눌렀을 때: 주소 + 혼잡도 + 출발/도착 버튼
+function popupAtPoint(lat, lng) {
+  const { zone, html } = zoneBadge(lat, lng);
+  let name = '선택한 위치';
+  const actions = [
+    { label: '여기서 출발', run: () => { setPlace('from', { lat, lng, name }); closePopup(); } },
+    { label: '여기로 도착', run: () => { setPlace('to', { lat, lng, name }); closePopup(); } },
+  ];
+  if (zone) actions.push({ label: '구역 자세히', run: () => { selectZone(zone.id, false); scrollToCard('zoneCard'); } });
+  const el = showPopup(lat, lng, name, html, actions);
+  if (kakao?.maps?.services?.Geocoder) {
+    new kakao.maps.services.Geocoder().coord2Address(lng, lat, (res, status) => {
+      if (status !== kakao.maps.services.Status.OK || !res[0] || popup?.getContent?.() !== el) return;
+      name = (res[0].road_address?.address_name || res[0].address?.address_name || name).replace(/^경북 경주시 /, '');
+      el.querySelector('.pop-title').textContent = name;
+    });
+  }
+}
+
+// 주요 관광지 표시 (지도에 항상)
+function drawAttractionMarks() {
+  for (const a of ATTRACTIONS) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'attr-dot';
+    el.textContent = a.name;
+    el.addEventListener('click', () => openAttraction(a));
+    new kakao.maps.CustomOverlay({ position: new kakao.maps.LatLng(a.position[0], a.position[1]), content: el, yAnchor: 0.5, xAnchor: 0, zIndex: 2, clickable: true }).setMap(map);
+  }
+}
+
+function openAttraction(a) {
+  const place = PLACES.find((p) => attractionFor(p.name) === a) || { name: a.name, region: '', address: '', phone: null };
+  openPlace(place, { scroll: false, knownPos: a.position });
+  const { html } = zoneBadge(a.position[0], a.position[1]);
+  showPopup(a.position[0], a.position[1], a.name, `${html}${html ? '<br/>' : ''}<span>보통 ${a.stayMin}분 머물러요</span>`, [
+    { label: '여기서 출발', run: () => { setPlace('from', { lat: a.position[0], lng: a.position[1], name: a.name }); closePopup(); } },
+    { label: '여기로 도착', run: () => { setPlace('to', { lat: a.position[0], lng: a.position[1], name: a.name }); closePopup(); } },
+    { label: '자세히', run: () => scrollToCard('placeCard') },
+  ]);
 }
 
 function renderMapZones() {
@@ -311,6 +397,7 @@ function updateRouteButton() {
 }
 
 function setMode(mode) {
+  if (state.nav) stopNav();
   state.mode = mode;
   document.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
   updateRouteButton();
@@ -362,16 +449,16 @@ async function locatePlace(p) {
   return pos;
 }
 
-async function openPlace(p) {
-  state.place = { ...p, pos: null, loading: true };
+async function openPlace(p, { scroll = true, knownPos = null } = {}) {
+  state.place = { ...p, pos: knownPos, loading: !knownPos };
   renderPlaceCard();
-  $('placeCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  const pos = await locatePlace(p);
+  if (scroll) $('placeCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  const pos = knownPos || (await locatePlace(p));
   if (state.place?.name !== p.name) return; // 그사이 다른 곳을 눌렀으면 무시
   state.place = { ...p, pos, loading: false };
   renderPlaceCard();
-  drawPlacePin();
-  if (map && pos) map.panTo(new kakao.maps.LatLng(pos[0], pos[1]));
+  if (!knownPos) drawPlacePin(); // 지도에 이미 표시된 관광지는 핀 생략
+  if (map && pos && !knownPos) map.panTo(new kakao.maps.LatLng(pos[0], pos[1]));
 }
 
 function drawPlacePin() {
@@ -418,7 +505,9 @@ function renderPlaceCard() {
   if (!p) { card.hidden = true; return; }
   card.hidden = false;
   const a = attractionFor(p.name);
-  const parts = [`<h3>${esc(p.name)}</h3><p class="why">${esc(p.region)} · ${esc(p.address)}${p.phone ? ` · <a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>` : ''}</p>`];
+  const meta = [p.region, p.address].filter(Boolean).map(esc);
+  if (p.phone) meta.push(`<a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>`);
+  const parts = [`<h3>${esc(p.name)}</h3>${meta.length ? `<p class="why">${meta.join(' · ')}</p>` : ''}`];
 
   if (p.loading) parts.push('<p class="why">위치 찾는 중…</p>');
   else if (!p.pos) parts.push('<p class="why">지도에서 위치를 찾지 못했어요. 카카오맵에서 확인해 주세요.</p>');
@@ -563,6 +652,7 @@ function alertRoute(msg) {
 
 async function findRoute() {
   if (!state.from || !state.to) return;
+  if (state.nav) stopNav();
   return state.mode === 'bus' ? findTransit() : findPathRoute(state.mode);
 }
 
@@ -596,6 +686,7 @@ async function findPathRoute(mode) {
     state.routes[mode] = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid };
     drawRoute();
     renderRouteResult();
+    if (state.autoNav) { state.autoNav = false; startNavFromResult(); }
   } catch (e) {
     alertRoute(`길을 찾지 못했어요. ${e.message}`);
   } finally {
@@ -640,6 +731,7 @@ async function findTransit() {
     };
     drawRoute();
     renderRouteResult();
+    if (state.autoNav) { state.autoNav = false; startNavFromResult(); }
     if (state.transit.isNow) loadArrivals();
   } catch (e) {
     alertRoute(`버스 경로를 찾지 못했어요. ${e.message}`);
@@ -789,6 +881,7 @@ function liveLine(r) {
 }
 
 function renderTransitResult() {
+  if (state.nav) return renderNavPanel();
   const box = $('routeResult');
   const t = state.transit;
   if (!t) { box.innerHTML = ''; return; }
@@ -828,6 +921,7 @@ function renderTransitResult() {
     }
     steps.push(`<li>내려서 도착지까지 걷기<span>약 ${walkMinutes(sel.walkEndM)}분</span></li>`);
     parts.push(`<details class="steps" open><summary>${t.selected === 0 ? '추천 경로' : '고른 경로'} 타는 순서</summary><ol>${steps.join('')}</ol></details>`);
+    parts.push(NAV_BUTTON);
 
     const straight = distanceM([t.from.lat, t.from.lng], [t.to.lat, t.to.lng]);
     const walkOnly = walkMinutes(straight);
@@ -857,9 +951,11 @@ function renderTransitResult() {
     }),
   );
   box.querySelector('[data-live-refresh]')?.addEventListener('click', loadArrivals);
+  box.querySelector('[data-nav-start]')?.addEventListener('click', startNavFromResult);
 }
 
 function renderRouteResult() {
+  if (state.nav) return renderNavPanel();
   if (state.mode === 'bus') return renderTransitResult();
   const box = $('routeResult');
   const route = state.routes[state.mode];
@@ -907,11 +1003,290 @@ function renderRouteResult() {
     parts.push(`<p class="warn">고른 시간이 바뀌었어요. 다시 찾으면 ${state.hour}시 혼잡도로 계산해요.</p>`);
   }
   if (main.instructions.length) {
+    parts.push(NAV_BUTTON);
     parts.push(`<details class="steps"><summary>${W.steps} (${main.instructions.length}단계)</summary><ol>${main.instructions
       .map((i) => `<li>${esc(i.text)}${i.distanceM ? `<span>${fmtDist(i.distanceM)}</span>` : ''}</li>`)
       .join('')}</ol></details>`);
   }
   box.innerHTML = parts.join('');
+  box.querySelector('[data-nav-start]')?.addEventListener('click', startNavFromResult);
+}
+
+// ── 길 안내 ───────────────────────────────────────────
+const NAV_BUTTON = '<button type="button" class="primary nav-start" data-nav-start>이 길로 안내 시작</button>';
+const MODE_WORD = { walk: '걸어서', bus: '버스', car: '차' };
+
+function startNavFromResult() {
+  let plan = null;
+  if (state.mode === 'bus') {
+    const t = state.transit;
+    const r = t?.ranked[t.selected];
+    if (r) {
+      plan = planFromTransit(r, t.from, t.to, busNames);
+      plan.live = r.live || null;
+    }
+  } else {
+    const route = state.routes[state.mode];
+    const main = route && (route.smart || route.plain);
+    if (main) plan = planFromPath(main, state.mode === 'car' ? 'car' : 'walk');
+  }
+  if (!plan || !plan.steps.length || plan.coords.length < 2) {
+    return alertRoute('이 경로는 단계별 안내 정보가 없어서 안내를 시작할 수 없어요. 다시 찾아 주세요.');
+  }
+  startNav(plan);
+}
+
+async function startNav(plan) {
+  closePopup();
+  state.nav = {
+    plan,
+    mode: state.mode,
+    pos: null,
+    status: null,
+    follow: true,
+    preview: false,
+    previewStep: 0,
+    voice: state.nav?.voice ?? false,
+    spoken: new Set(),
+    watchId: null,
+    wakeLock: null,
+    notice: null,
+  };
+  try { state.nav.wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* 화면 켜짐 유지는 안 돼도 괜찮음 */ }
+
+  if (!navigator.geolocation) {
+    enterPreview('이 브라우저는 위치 정보를 지원하지 않아서 미리보기로 보여드려요.');
+  } else {
+    state.nav.notice = '내 위치를 찾는 중이에요…';
+    state.nav.watchId = navigator.geolocation.watchPosition(onNavPosition, onNavError, {
+      enableHighAccuracy: true, maximumAge: 2000, timeout: 20000,
+    });
+  }
+  updateNav();
+  if (window.innerWidth < 900) $('map').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function stopNav() {
+  const nav = state.nav;
+  if (!nav) return;
+  if (nav.watchId !== null) navigator.geolocation.clearWatch(nav.watchId);
+  try { nav.wakeLock?.release(); } catch { /* 무시 */ }
+  try { window.speechSynthesis?.cancel(); } catch { /* 무시 */ }
+  drawn.me?.setMap(null);
+  drawn.stepLine?.setMap(null);
+  drawn.me = null;
+  drawn.stepLine = null;
+  state.nav = null;
+  $('navBar').hidden = true;
+  renderRouteResult();
+}
+
+function onNavPosition(p) {
+  const nav = state.nav;
+  if (!nav) return;
+  const pos = [p.coords.latitude, p.coords.longitude];
+  if (nav.preview) { nav.gps = pos; return; }
+  // 경로에서 2km 넘게 떨어져 있으면(다른 도시 등) 다시 찾기보다 미리보기가 맞아요
+  if (navStatus(nav.plan, pos).offBy > 2000) {
+    nav.gps = pos;
+    return enterPreview('지금 위치가 경로에서 멀어서 미리보기로 보여드려요. 경로 근처에 가면 "내 위치로 안내"를 눌러 주세요.');
+  }
+  nav.pos = pos;
+  nav.notice = null;
+  updateNav();
+}
+
+function onNavError(err) {
+  const nav = state.nav;
+  if (!nav || nav.preview) return;
+  // 이미 위치를 받은 뒤 잠깐 신호가 끊긴 건 그냥 기다려요
+  if (nav.pos && err.code !== 1) {
+    nav.notice = 'GPS 신호가 약해요. 마지막 위치로 안내 중이에요.';
+    return renderNavBar();
+  }
+  enterPreview(err.code === 1
+    ? '위치 권한이 꺼져 있어서 미리보기로 보여드려요. 주소창의 자물쇠 아이콘에서 위치를 허용하면 실제 안내가 돼요.'
+    : '현재 위치를 찾지 못해서 미리보기로 보여드려요.');
+}
+
+function enterPreview(notice) {
+  const nav = state.nav;
+  nav.preview = true;
+  nav.notice = notice || null;
+  setPreviewStep(nav.previewStep || 0);
+}
+
+function setPreviewStep(k) {
+  const nav = state.nav;
+  const steps = nav.plan.steps;
+  nav.previewStep = Math.max(0, Math.min(steps.length - 1, k));
+  const step = steps[nav.previewStep];
+  const c = nav.plan.coords[Math.min(step.from + (step.to > step.from ? 1 : 0), nav.plan.coords.length - 1)];
+  const a = nav.plan.coords[step.from];
+  // 단계 시작점에서 살짝 들어간 위치로 가정
+  nav.pos = [a[1] + (c[1] - a[1]) * 0.05, a[0] + (c[0] - a[0]) * 0.05];
+  nav.follow = true;
+  updateNav();
+}
+
+function useGpsAgain() {
+  const nav = state.nav;
+  nav.preview = false;
+  nav.notice = nav.gps ? null : '내 위치를 찾는 중이에요…';
+  if (nav.gps) nav.pos = nav.gps;
+  updateNav();
+}
+
+function speak(text) {
+  if (!state.nav?.voice || !window.speechSynthesis) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ko-KR';
+    window.speechSynthesis.speak(u);
+  } catch { /* 음성 안 되는 기기 */ }
+}
+
+function updateNav() {
+  const nav = state.nav;
+  if (!nav) return;
+  const prev = nav.status;
+  nav.status = nav.pos ? navStatus(nav.plan, nav.pos) : null;
+  const st = nav.status;
+
+  if (st && !nav.preview) {
+    const step = nav.plan.steps[st.stepIndex];
+    const key = `s${st.stepIndex}`;
+    if (!nav.spoken.has(key)) { nav.spoken.add(key); speak(step.text); }
+    if (step.next && st.distToNext < 30 && !nav.spoken.has(`${key}n`)) { nav.spoken.add(`${key}n`); speak(`곧 ${step.next.text}`); }
+    if (st.arrived && !nav.spoken.has('arrived')) { nav.spoken.add('arrived'); speak('도착했어요. 안내를 마칠게요.'); }
+  }
+  if (prev?.stepIndex !== st?.stepIndex || nav.preview) renderNavPanel();
+  renderNavBar();
+  drawNavOnMap();
+}
+
+function navHeadline(nav, st) {
+  const step = nav.plan.steps[st.stepIndex];
+  if (st.arrived) return { arrow: '◎', big: '도착했어요', small: '안내를 끝내려면 "안내 끝내기"를 누르세요.' };
+  if (step.kind === 'ride') {
+    const left = Math.max(1, Math.ceil((step.stopCount || 1) * (1 - st.stepProgress)));
+    return st.distToNext < 300
+      ? { arrow: '⇣', big: '곧 내려요', small: `${step.alight || '내릴 정류장'}에서 내리세요` }
+      : { arrow: '🚌', big: `약 ${left}정류장 남음`, small: `${step.bus}번 · ${step.alight || ''}에서 내리세요` };
+  }
+  if (step.kind === 'walk' && step.next?.kind === 'ride') {
+    const L = nav.plan.live;
+    const liveText = L && L.wait !== undefined ? ` · ${L.routeNo}번 ${L.minutes}분 후 도착(출발할 때 기준)` : '';
+    return { arrow: '🚏', big: `정류장까지 ${fmtDist(Math.round(st.distToNext))}`, small: `${step.text}${liveText}` };
+  }
+  if (!step.next) return { arrow: '◎', big: `${fmtDist(Math.round(st.distToNext))} 남음`, small: step.text };
+  return { arrow: signArrow(step.next.sign), big: `${fmtDist(Math.round(st.distToNext))} 후`, small: step.next.text };
+}
+
+function renderNavBar() {
+  const nav = state.nav;
+  const bar = $('navBar');
+  if (!nav) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const st = nav.status;
+  let body;
+  if (!st) {
+    body = `<div class="nav-main"><span class="nav-arrow">…</span><div><strong class="nav-big">안내 준비 중</strong><span class="nav-small">${esc(nav.notice || '')}</span></div></div>`;
+  } else if (st.offRoute && !nav.preview) {
+    body = `<div class="nav-main off"><span class="nav-arrow">!</span><div><strong class="nav-big">경로에서 ${fmtDist(Math.round(st.offBy))} 벗어났어요</strong><span class="nav-small">지금 위치에서 다시 찾을 수 있어요.</span></div></div>
+      <div class="nav-actions"><button type="button" class="chip" data-nav-reroute>다시 찾기</button></div>`;
+  } else {
+    const h = navHeadline(nav, st);
+    const mins = Math.max(1, Math.round((nav.plan.minutes || 0) * st.remainingRatio));
+    body = `<div class="nav-main"><span class="nav-arrow">${esc(h.arrow)}</span><div><strong class="nav-big">${esc(h.big)}</strong><span class="nav-small">${esc(h.small)}</span></div></div>
+      <div class="nav-meta">남은 ${fmtDist(Math.round(st.remaining))} · 약 ${mins}분${nav.preview ? ' · 미리보기' : ''}</div>`;
+  }
+  const controls = [];
+  if (nav.preview) {
+    controls.push('<button type="button" class="chip" data-nav-prev aria-label="이전 단계">◀</button>');
+    controls.push(`<span class="nav-count">${nav.previewStep + 1}/${nav.plan.steps.length}</span>`);
+    controls.push('<button type="button" class="chip" data-nav-next aria-label="다음 단계">▶</button>');
+    if (navigator.geolocation) controls.push('<button type="button" class="chip" data-nav-gps>내 위치로 안내</button>');
+  } else if (!nav.follow) {
+    controls.push('<button type="button" class="chip" data-nav-follow>내 위치 따라가기</button>');
+  }
+  controls.push(`<button type="button" class="chip" data-nav-voice aria-pressed="${nav.voice}">${nav.voice ? '음성 끄기' : '음성 켜기'}</button>`);
+  controls.push('<button type="button" class="chip nav-stop" data-nav-stop>안내 끝내기</button>');
+  bar.innerHTML = `${body}${nav.notice && st ? `<p class="nav-notice">${esc(nav.notice)}</p>` : ''}<div class="nav-controls">${controls.join('')}</div>`;
+
+  bar.querySelector('[data-nav-stop]').addEventListener('click', stopNav);
+  bar.querySelector('[data-nav-voice]').addEventListener('click', () => {
+    nav.voice = !nav.voice;
+    if (nav.voice && st) speak(nav.plan.steps[st.stepIndex].text);
+    renderNavBar();
+  });
+  bar.querySelector('[data-nav-prev]')?.addEventListener('click', () => setPreviewStep(nav.previewStep - 1));
+  bar.querySelector('[data-nav-next]')?.addEventListener('click', () => setPreviewStep(nav.previewStep + 1));
+  bar.querySelector('[data-nav-gps]')?.addEventListener('click', useGpsAgain);
+  bar.querySelector('[data-nav-follow]')?.addEventListener('click', () => { nav.follow = true; updateNav(); });
+  bar.querySelector('[data-nav-reroute]')?.addEventListener('click', () => {
+    setPlace('from', { lat: nav.pos[0], lng: nav.pos[1], name: '내 위치' });
+    state.autoNav = true;
+    findRoute();
+  });
+}
+
+function renderNavPanel() {
+  const nav = state.nav;
+  const box = $('routeResult');
+  if (!nav) return;
+  const cur = nav.status?.stepIndex ?? -1;
+  const items = nav.plan.steps.map((s, k) => {
+    const len = Math.round(nav.plan.cum[Math.min(s.to, nav.plan.cum.length - 1)] - nav.plan.cum[s.from]);
+    const arrow = s.kind === 'ride' ? '🚌' : signArrow(s.sign);
+    return `<li${k === cur ? ' class="current" aria-current="step"' : ''}><button type="button" data-nav-step="${k}"><span class="nav-step-arrow">${esc(arrow)}</span>${esc(s.text)}${len ? `<span>${fmtDist(len)}</span>` : ''}</button></li>`;
+  });
+  box.innerHTML = `<div class="nav-panel">
+      <div class="result-main">${MODE_WORD[nav.mode]} 안내 중 <span class="dist">${fmtDist(Math.round(nav.plan.cum[nav.plan.cum.length - 1]))} · 약 ${nav.plan.minutes}분</span></div>
+      <p class="why">${nav.preview ? '미리보기예요. 단계를 누르면 그 지점으로 이동해요.' : 'GPS로 내 위치를 따라가며 안내해요. 화면이 꺼지지 않게 해두세요.'}</p>
+      <ol class="nav-steps">${items.join('')}</ol>
+      <button type="button" class="primary nav-stop-big" data-nav-stop>안내 끝내기</button>
+    </div>`;
+  box.querySelector('[data-nav-stop]').addEventListener('click', stopNav);
+  box.querySelectorAll('[data-nav-step]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const k = Number(b.dataset.navStep);
+      if (!nav.preview) enterPreview('단계를 눌러서 미리보기로 바꿨어요. "내 위치로 안내"를 누르면 돌아가요.');
+      setPreviewStep(k);
+    }),
+  );
+}
+
+function drawNavOnMap() {
+  const nav = state.nav;
+  if (!map || !nav) return;
+  const st = nav.status;
+  if (nav.pos) {
+    const ll = new kakao.maps.LatLng(nav.pos[0], nav.pos[1]);
+    if (!drawn.me) {
+      const el = document.createElement('div');
+      el.className = 'me-dot';
+      drawn.me = new kakao.maps.CustomOverlay({ position: ll, content: el, zIndex: 9 });
+      drawn.me.setMap(map);
+      kakao.maps.event.addListener(map, 'dragstart', () => {
+        if (state.nav && state.nav.follow) { state.nav.follow = false; renderNavBar(); }
+      });
+    } else {
+      drawn.me.setPosition(ll);
+    }
+    if (nav.follow) map.panTo(ll);
+  }
+  drawn.stepLine?.setMap(null);
+  drawn.stepLine = null;
+  if (st) {
+    const step = nav.plan.steps[st.stepIndex];
+    const path = nav.plan.coords.slice(step.from, step.to + 1).map(([lng, lat]) => new kakao.maps.LatLng(lat, lng));
+    if (path.length >= 2) {
+      drawn.stepLine = new kakao.maps.Polyline({ path, strokeWeight: 9, strokeColor: '#F0C24B', strokeOpacity: 0.9, strokeStyle: 'solid' });
+      drawn.stepLine.setMap(map);
+    }
+  }
 }
 
 // ── 지도 불러오기 ─────────────────────────────────────
@@ -957,6 +1332,7 @@ async function initMap() {
     onPointClick(e.latLng);
   });
   if (DRAW_MODE) setupDrawTool();
+  else drawAttractionMarks();
   window.addEventListener('resize', () => map.relayout());
   render();
   drawPin('from');
@@ -1040,7 +1416,11 @@ function wire() {
   });
   $('gpsBtn').addEventListener('click', useMyLocation);
   document.querySelectorAll('[data-pick]').forEach((b) => b.addEventListener('click', () => setPickMode(b.dataset.pick)));
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.pick) setPickMode(state.pick); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (state.pick) setPickMode(state.pick);
+    else closePopup();
+  });
   $('routeBtn').addEventListener('click', findRoute);
   document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
   wireSearch('from');

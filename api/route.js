@@ -68,7 +68,7 @@ function summarize(path) {
     coords, // [경도, 위도]
     instructions: (path.instructions || [])
       .filter((i) => i.sign !== 5) // '경유지 도착' 안내는 빼기
-      .map((i) => ({ text: i.text, distanceM: Math.round(i.distance) })),
+      .map((i) => ({ text: i.text, distanceM: Math.round(i.distance), sign: i.sign, interval: i.interval })),
     passes: areasOnPath(coords, AREAS),
   };
 }
