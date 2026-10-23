@@ -227,6 +227,24 @@ details.steps li span { color: var(--muted); font-size: 12px; margin-left: 4px; 
 
 .foot { font-size: 12px; color: var(--muted); padding-top: 16px; }
 
+/* 구역 그리기 도구 (?draw) */
+.draw-panel {
+  position: absolute; left: 12px; bottom: 12px; z-index: 6; width: min(340px, calc(100% - 24px));
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px; box-shadow: 0 6px 18px rgba(28, 43, 37, 0.18); font-size: 13px;
+}
+.draw-panel p { margin: 4px 0 8px; color: var(--muted); }
+.draw-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.draw-panel textarea {
+  width: 100%; margin-top: 8px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; resize: vertical;
+}
+.draw-help { font-size: 12px; margin-bottom: 0 !important; }
+.draft-dot {
+  width: 20px; height: 20px; border-radius: 50%; background: var(--ink); color: #fff;
+  font: 700 11px/20px var(--font); text-align: center; transform: translateY(0);
+}
+
 /* 지도 위 출발·도착 표시 */
 .pin {
   font-family: var(--font); font-size: 12px; font-weight: 700; color: #fff; background: var(--ink);

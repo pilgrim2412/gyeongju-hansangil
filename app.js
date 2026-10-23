@@ -4,7 +4,7 @@ import { ATTRACTIONS } from './data/attractions.js';
 import { CLOSURES } from './data/closures.js';
 import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
-import { isNearGyeongju, GYEONGJU_CENTER, distanceM } from './lib/geo.js';
+import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter } from './lib/geo.js';
 import { rankTransit, walkMinutes } from './lib/transit.js';
 
 const $ = (id) => document.getElementById(id);
@@ -12,6 +12,7 @@ const HOURS = Array.from({ length: 18 }, (_, i) => i + 6); // 6시 ~ 23시
 const COLORS = { low: '#9CC79A', mid: '#F0C24B', high: '#E5823A', peak: '#B8323B' };
 const BASE_WORD = { 1: '낮음', 2: '보통', 3: '높음' };
 const AVOID_KEYS = ['mid', 'high', 'peak'];
+const DRAW_MODE = new URLSearchParams(location.search).has('draw'); // 주소 뒤에 ?draw → 구역 그리기 도구
 
 const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -37,7 +38,9 @@ const state = {
 
 let kakao = null;
 let map = null;
-const drawn = { zones: {}, closures: [], routes: [], pins: {}, marks: [] };
+const drawn = { zones: {}, closures: [], routes: [], pins: {}, marks: [], draft: [] };
+const draft = []; // 구역 그리기로 찍은 점 [위도, 경도]
+let lastShapeClick = 0;
 
 // ── 혼잡도 ───────────────────────────────────────────
 function levelsAt(ymd, hour) {
@@ -126,9 +129,10 @@ function renderClosures() {
   drawn.closures.forEach((s) => s.setMap(null));
   drawn.closures = [];
   for (const c of active) {
-    const center = new kakao.maps.LatLng(c.center[0], c.center[1]);
-    const circle = new kakao.maps.Circle({
-      center, radius: c.radiusM, strokeWeight: 3, strokeColor: COLORS.peak, strokeOpacity: 1,
+    const [clat, clng] = areaCenter(c);
+    const center = new kakao.maps.LatLng(clat, clng);
+    const circle = makeShape(c, {
+      strokeWeight: 3, strokeColor: COLORS.peak, strokeOpacity: 1,
       strokeStyle: 'shortdash', fillColor: COLORS.peak, fillOpacity: 0.08,
     });
     const tag = document.createElement('div');
@@ -141,6 +145,38 @@ function renderClosures() {
   }
 }
 
+// 구역 모양 그리기: polygon이 있으면 다각형, 없으면 원
+function makeShape(area, style = {}) {
+  if (area.polygon?.length >= 3) {
+    return new kakao.maps.Polygon({
+      path: area.polygon.map(([lat, lng]) => new kakao.maps.LatLng(lat, lng)),
+      ...style,
+    });
+  }
+  return new kakao.maps.Circle({
+    center: new kakao.maps.LatLng(area.center[0], area.center[1]),
+    radius: area.radiusM,
+    ...style,
+  });
+}
+
+// 구역 위를 눌렀을 때: 장소 고르기·구역 그리기 중이면 그 지점을 쓰고, 아니면 구역 정보 열기
+function onShapeClick(e, zoneId) {
+  lastShapeClick = Date.now();
+  if ((state.pick || DRAW_MODE) && e?.latLng) return onPointClick(e.latLng);
+  if (zoneId) selectZone(zoneId, false);
+}
+
+function onPointClick(latLng) {
+  if (state.pick) {
+    const which = state.pick;
+    setPlace(which, { lat: latLng.getLat(), lng: latLng.getLng(), name: '지도에서 고른 곳' });
+    setPickMode(which); // 끄기
+    return;
+  }
+  if (DRAW_MODE) addDraftPoint(latLng.getLat(), latLng.getLng());
+}
+
 function renderMapZones() {
   if (!map) return;
   const levels = levelsAt(state.ymd, state.hour);
@@ -150,12 +186,13 @@ function renderMapZones() {
     const selected = state.zoneId === z.id;
     let d = drawn.zones[z.id];
     if (!d) {
-      const center = new kakao.maps.LatLng(z.center[0], z.center[1]);
-      const circle = new kakao.maps.Circle({ center, radius: z.radiusM });
+      const [clat, clng] = areaCenter(z);
+      const center = new kakao.maps.LatLng(clat, clng);
+      const circle = makeShape(z);
       const tag = document.createElement('div');
-      tag.addEventListener('click', () => selectZone(z.id, false));
+      tag.addEventListener('click', () => { if (!state.pick && !DRAW_MODE) selectZone(z.id, false); });
       const overlay = new kakao.maps.CustomOverlay({ position: center, content: tag, yAnchor: 0.5, clickable: true });
-      kakao.maps.event.addListener(circle, 'click', () => selectZone(z.id, false));
+      kakao.maps.event.addListener(circle, 'click', (e) => onShapeClick(e, z.id));
       circle.setMap(map);
       overlay.setMap(map);
       d = drawn.zones[z.id] = { circle, tag };
@@ -224,7 +261,10 @@ function selectZone(id, pan) {
   state.zoneId = id;
   render();
   const z = zoneById(id);
-  if (pan && map && z) map.panTo(new kakao.maps.LatLng(z.center[0], z.center[1]));
+  if (pan && map && z) {
+    const [lat, lng] = areaCenter(z);
+    map.panTo(new kakao.maps.LatLng(lat, lng));
+  }
 }
 
 // ── 장소 고르기 ───────────────────────────────────────
@@ -694,16 +734,76 @@ async function initMap() {
     level: 7,
   });
   kakao.maps.event.addListener(map, 'click', (e) => {
-    if (!state.pick) return;
-    const which = state.pick;
-    setPlace(which, { lat: e.latLng.getLat(), lng: e.latLng.getLng(), name: '지도에서 고른 곳' });
-    setPickMode(which); // 끄기
+    if (Date.now() - lastShapeClick < 300) return; // 구역 위를 누른 건 이미 처리함
+    onPointClick(e.latLng);
   });
+  if (DRAW_MODE) setupDrawTool();
   window.addEventListener('resize', () => map.relayout());
   render();
   drawPin('from');
   drawPin('to');
   drawRoute();
+}
+
+// ── 구역 그리기 도구 (주소 뒤에 ?draw) ────────────────────
+function setupDrawTool() {
+  const panel = document.createElement('div');
+  panel.className = 'draw-panel';
+  panel.innerHTML = `
+    <strong>구역 그리기</strong>
+    <p>지도를 눌러 구역 꼭짓점을 차례로 찍으세요. 지금 <b id="draftCount">0</b>개</p>
+    <div class="draw-actions">
+      <button type="button" class="chip" id="draftUndo">하나 지우기</button>
+      <button type="button" class="chip" id="draftClear">처음부터</button>
+      <button type="button" class="chip" id="draftCopy">좌표 복사</button>
+    </div>
+    <textarea id="draftOut" rows="4" readonly placeholder="점을 3개 이상 찍으면 여기에 좌표가 나와요."></textarea>
+    <p class="draw-help" id="draftMsg">복사한 내용을 data/zones.js 의 그 구역 polygon 자리에 붙여넣으면 돼요.</p>`;
+  document.querySelector('.map-wrap').append(panel);
+  $('draftUndo').addEventListener('click', () => { draft.pop(); renderDraft(); });
+  $('draftClear').addEventListener('click', () => { draft.length = 0; renderDraft(); });
+  $('draftCopy').addEventListener('click', async () => {
+    const text = $('draftOut').value;
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      $('draftMsg').textContent = '복사했어요. data/zones.js 의 그 구역 polygon 자리에 붙여넣으세요.';
+    } catch {
+      $('draftOut').select();
+      $('draftMsg').textContent = '자동 복사가 막혀 있어요. 글자가 선택돼 있으니 Ctrl+C 를 눌러 주세요.';
+    }
+  });
+  renderDraft();
+}
+
+function addDraftPoint(lat, lng) {
+  draft.push([+lat.toFixed(5), +lng.toFixed(5)]);
+  renderDraft();
+}
+
+function renderDraft() {
+  drawn.draft.forEach((x) => x.setMap(null));
+  drawn.draft = [];
+  $('draftCount').textContent = String(draft.length);
+  $('draftOut').value = draft.length >= 3
+    ? `polygon: [\n${draft.map(([a, b]) => `  [${a.toFixed(5)}, ${b.toFixed(5)}],`).join('\n')}\n],`
+    : '';
+  if (!map || !draft.length) return;
+  const path = draft.map(([a, b]) => new kakao.maps.LatLng(a, b));
+  const style = { strokeWeight: 3, strokeColor: '#1C2B25', strokeOpacity: 1, strokeStyle: 'solid' };
+  const shape = draft.length >= 3
+    ? new kakao.maps.Polygon({ path, ...style, fillColor: '#1C2B25', fillOpacity: 0.12 })
+    : new kakao.maps.Polyline({ path, ...style });
+  shape.setMap(map);
+  drawn.draft.push(shape);
+  draft.forEach(([a, b], i) => {
+    const dot = document.createElement('div');
+    dot.className = 'draft-dot';
+    dot.textContent = String(i + 1);
+    const o = new kakao.maps.CustomOverlay({ position: new kakao.maps.LatLng(a, b), content: dot, zIndex: 4 });
+    o.setMap(map);
+    drawn.draft.push(o);
+  });
 }
 
 // ── 시작 ─────────────────────────────────────────────

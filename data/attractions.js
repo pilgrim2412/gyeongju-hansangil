@@ -26,7 +26,7 @@ export const ATTRACTIONS = [
     id: 'daereungwon',
     name: '대릉원·천마총',
     position: [35.8381, 129.2125],
-    zone: 'hwangnidan',
+    zone: 'daereungwon',
     stayMin: 60,
     highlights: ['천마총 내부 관람', '봄에는 고분 사이 목련 포토 스팟'],
     links: [{ label: '카카오맵에서 보기', url: kakaoSearch('경주 대릉원') }],
