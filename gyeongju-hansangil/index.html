@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>경주 한산길</title>
+  <meta name="description" content="시간대별로 경주에서 붐비는 곳을 보고, 피해서 걷는 길을 찾아요." />
+  <meta name="theme-color" content="#1C2B25" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="brand">
+      <h1>경주 한산길</h1>
+      <p>붐비는 시간과 장소를 보고, 피해서 걷는 길을 찾아요.</p>
+    </header>
+
+    <div class="map-wrap">
+      <div id="map" class="map" aria-label="경주 지도"></div>
+      <div id="mapNotice" class="map-notice" hidden></div>
+      <div id="pickHint" class="pick-hint" hidden></div>
+    </div>
+
+    <main class="panel">
+      <section class="when" aria-labelledby="whenTitle">
+        <h2 id="whenTitle" class="sr-only">언제</h2>
+        <div class="when-row">
+          <button type="button" class="icon-btn" id="prevDay" aria-label="전날">‹</button>
+          <label class="date-field">
+            <span id="dayLabel" class="day-label"></span>
+            <input type="date" id="dateInput" aria-label="날짜 선택" />
+          </label>
+          <button type="button" class="icon-btn" id="nextDay" aria-label="다음날">›</button>
+          <button type="button" class="chip" id="nowBtn">지금</button>
+        </div>
+        <div class="hour-row">
+          <input type="range" id="hourInput" min="6" max="23" step="1" aria-label="시간 선택" />
+          <output id="hourLabel" for="hourInput"></output>
+        </div>
+      </section>
+
+      <section class="table" aria-labelledby="tableTitle">
+        <div class="section-head">
+          <h2 id="tableTitle">시간대별 혼잡</h2>
+          <ul class="legend" aria-label="범례">
+            <li><i class="lv-low"></i>한산</li>
+            <li><i class="lv-mid"></i>보통</li>
+            <li><i class="lv-high"></i>혼잡</li>
+            <li><i class="lv-peak"></i>매우 혼잡</li>
+          </ul>
+        </div>
+        <div id="grid" class="grid" role="grid" aria-label="구역별 시간대 혼잡도. 칸을 누르면 그 시간으로 바뀌어요."></div>
+        <p id="source" class="source"></p>
+      </section>
+
+      <div id="closureBanner" class="closure-banner" hidden></div>
+
+      <section class="route" aria-labelledby="routeTitle">
+        <div class="route-head">
+          <h2 id="routeTitle">길찾기</h2>
+          <div class="mode" role="radiogroup" aria-label="이동 방법">
+            <button type="button" role="radio" aria-checked="true" data-mode="walk">걸어서</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="bus">버스</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="car">차</button>
+          </div>
+        </div>
+
+        <div class="place-field">
+          <label for="fromInput">출발</label>
+          <div class="place-input">
+            <input id="fromInput" type="search" placeholder="장소 검색" autocomplete="off" />
+            <button type="button" class="chip" id="gpsBtn">내 위치</button>
+            <button type="button" class="chip" data-pick="from">지도에서</button>
+          </div>
+          <ul class="suggest" id="fromSuggest" hidden></ul>
+        </div>
+
+        <div class="place-field">
+          <label for="toInput">도착</label>
+          <div class="place-input">
+            <input id="toInput" type="search" placeholder="장소 검색" autocomplete="off" />
+            <button type="button" class="chip" data-pick="to">지도에서</button>
+          </div>
+          <ul class="suggest" id="toSuggest" hidden></ul>
+          <div class="quick" id="quickTo" aria-label="자주 가는 곳"></div>
+        </div>
+
+        <button type="button" class="primary" id="routeBtn" disabled>한산한 길 찾기</button>
+        <div id="routeResult" class="route-result" aria-live="polite"></div>
+      </section>
+
+      <section id="zoneCard" class="zone-card" hidden aria-live="polite"></section>
+
+      <footer class="foot">
+        혼잡도는 데이터랩 월별 방문자, 관광지 집중률 예측, 평소 패턴을 합친 추정값이에요.
+      </footer>
+    </main>
+  </div>
+
+  <script type="module" src="/app.js" onerror="document.getElementById('mapNotice').hidden=false;document.getElementById('mapNotice').textContent='화면 코드를 불러오지 못했어요. GitHub에 api·data·lib 폴더 안의 파일이 전부 올라갔는지 확인해 주세요.'"></script>
+</body>
+</html>
