@@ -7,7 +7,7 @@
 
 import { ZONES } from '../data/zones.js';
 import { CLOSURES } from '../data/closures.js';
-import { circlePolygon, areasOnPath } from '../lib/geo.js';
+import { areaRing, areasOnPath } from '../lib/geo.js';
 
 const GH_URL = 'https://graphhopper.com/api/1/route';
 
@@ -96,7 +96,7 @@ export default async function handler(req, res) {
       type: 'Feature',
       id: areaId,
       properties: {},
-      geometry: { type: 'Polygon', coordinates: [circlePolygon(area.center, area.radiusM)] },
+      geometry: { type: 'Polygon', coordinates: [areaRing(area)] },
     });
     priority.push({ if: `in_${areaId}`, multiply_by: strength });
   }
