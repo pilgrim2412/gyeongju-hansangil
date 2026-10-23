@@ -60,7 +60,14 @@
       <div id="closureBanner" class="closure-banner" hidden></div>
 
       <section class="route" aria-labelledby="routeTitle">
-        <h2 id="routeTitle">걸어서 길찾기</h2>
+        <div class="route-head">
+          <h2 id="routeTitle">길찾기</h2>
+          <div class="mode" role="radiogroup" aria-label="이동 방법">
+            <button type="button" role="radio" aria-checked="true" data-mode="walk">걸어서</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="bus">버스</button>
+            <button type="button" role="radio" aria-checked="false" data-mode="car">차</button>
+          </div>
+        </div>
 
         <div class="place-field">
           <label for="fromInput">출발</label>

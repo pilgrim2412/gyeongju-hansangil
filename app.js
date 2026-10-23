@@ -4,7 +4,8 @@ import { ATTRACTIONS } from './data/attractions.js';
 import { CLOSURES } from './data/closures.js';
 import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
-import { isNearGyeongju, GYEONGJU_CENTER } from './lib/geo.js';
+import { isNearGyeongju, GYEONGJU_CENTER, distanceM } from './lib/geo.js';
+import { rankTransit, walkMinutes } from './lib/transit.js';
 
 const $ = (id) => document.getElementById(id);
 const HOURS = Array.from({ length: 18 }, (_, i) => i + 6); // 6시 ~ 23시
@@ -29,12 +30,14 @@ const state = {
   to: null,
   pick: null,
   zoneId: null,
-  route: null,
+  routes: { walk: null, car: null }, // 걸어서·차 경로 결과
+  mode: 'walk', // 'walk' | 'bus' | 'car'
+  transit: null,
 };
 
 let kakao = null;
 let map = null;
-const drawn = { zones: {}, closures: [], routes: [], pins: {} };
+const drawn = { zones: {}, closures: [], routes: [], pins: {}, marks: [] };
 
 // ── 혼잡도 ───────────────────────────────────────────
 function levelsAt(ymd, hour) {
@@ -258,7 +261,18 @@ function drawPin(which) {
 }
 
 function updateRouteButton() {
-  $('routeBtn').disabled = !(state.from && state.to);
+  const btn = $('routeBtn');
+  btn.disabled = !(state.from && state.to);
+  btn.textContent = { walk: '한산한 길 찾기', bus: '버스 경로 찾기', car: '덜 막히는 길 찾기' }[state.mode];
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
+  updateRouteButton();
+  $('routeResult').innerHTML = '';
+  drawRoute();
+  renderRouteResult();
 }
 
 function localMatches(q) {
@@ -371,6 +385,11 @@ function alertRoute(msg) {
 
 async function findRoute() {
   if (!state.from || !state.to) return;
+  return state.mode === 'bus' ? findTransit() : findPathRoute(state.mode);
+}
+
+// 걸어서·차: GraphHopper로 일반 경로 + 혼잡 회피 경로
+async function findPathRoute(mode) {
   if (state.config && !state.config.hasRouteKey) {
     return alertRoute('길찾기 키(GRAPHHOPPER_API_KEY)가 아직 설정되지 않았어요.');
   }
@@ -390,27 +409,76 @@ async function findRoute() {
       body: JSON.stringify({
         from: { lat: state.from.lat, lng: state.from.lng },
         to: { lat: state.to.lat, lng: state.to.lng },
+        profile: mode === 'car' ? 'car' : 'foot',
         avoid,
       }),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
-    state.route = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid };
+    state.routes[mode] = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid };
     drawRoute();
     renderRouteResult();
   } catch (e) {
     alertRoute(`길을 찾지 못했어요. ${e.message}`);
   } finally {
-    btn.textContent = '한산한 길 찾기';
     updateRouteButton();
   }
 }
 
-function drawRoute() {
-  if (!map || !state.route) return;
+async function findTransit() {
+  if (state.config && !state.config.hasTransitKey) {
+    return alertRoute('버스 경로 키(KAKAO_REST_KEY)가 아직 설정되지 않았어요.');
+  }
+  const btn = $('routeBtn');
+  btn.disabled = true;
+  btn.textContent = '찾는 중…';
+  try {
+    const r = await fetch('/api/transit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: { lat: state.from.lat, lng: state.from.lng, name: state.from.name },
+        to: { lat: state.to.lat, lng: state.to.lng, name: state.to.name },
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
+    const levels = levelsAt(state.ymd, state.hour);
+    const closureIds = activeClosures(CLOSURES, state.ymd, state.hour).map((c) => c.id);
+    state.transit = {
+      ranked: rankTransit(data.routes || [], levels, closureIds),
+      message: data.message || null,
+      landingURL: data.landingURL || null,
+      levels,
+      ymd: state.ymd,
+      hour: state.hour,
+      selected: 0,
+      from: state.from,
+      to: state.to,
+    };
+    drawRoute();
+    renderRouteResult();
+  } catch (e) {
+    alertRoute(`버스 경로를 찾지 못했어요. ${e.message}`);
+  } finally {
+    updateRouteButton();
+  }
+}
+
+function clearRouteDrawing() {
   drawn.routes.forEach((l) => l.setMap(null));
+  drawn.marks.forEach((m) => m.setMap(null));
   drawn.routes = [];
-  const { plain, smart } = state.route;
+  drawn.marks = [];
+}
+
+function drawRoute() {
+  if (!map) return;
+  clearRouteDrawing();
+  if (state.mode === 'bus') return drawTransit();
+  const route = state.routes[state.mode];
+  if (!route) return;
+  const { plain, smart } = route;
   const toPath = (coords) => coords.map(([lng, lat]) => new kakao.maps.LatLng(lat, lng));
   const bounds = new kakao.maps.LatLngBounds();
 
@@ -432,20 +500,132 @@ function drawRoute() {
   if (!bounds.isEmpty()) map.setBounds(bounds, 40, 40, 40, 40);
 }
 
-function renderRouteResult() {
+function drawTransit() {
+  const t = state.transit;
+  const r = t?.ranked[t.selected];
+  if (!r) return;
+  const LL = (lat, lng) => new kakao.maps.LatLng(lat, lng);
+  const bounds = new kakao.maps.LatLngBounds();
+  const addLine = (path, ride) => {
+    if (path.length < 2) return;
+    const line = new kakao.maps.Polyline({
+      path,
+      strokeWeight: ride ? 6 : 4,
+      strokeColor: ride ? '#2F6F8F' : '#8A968F',
+      strokeOpacity: 0.95,
+      strokeStyle: ride ? 'solid' : 'shortdash',
+    });
+    line.setMap(map);
+    drawn.routes.push(line);
+    path.forEach((p) => bounds.extend(p));
+  };
+
+  const all = r.steps.flatMap((s) => s.coords);
+  if (all.length) {
+    addLine([LL(t.from.lat, t.from.lng), LL(all[0][1], all[0][0])], false);
+    const last = all[all.length - 1];
+    addLine([LL(last[1], last[0]), LL(t.to.lat, t.to.lng)], false);
+  }
+  for (const s of r.steps) {
+    const ride = s.type !== 'WALKING';
+    addLine(s.coords.map(([lng, lat]) => LL(lat, lng)), ride);
+    if (ride && s.coords.length) {
+      const el = document.createElement('div');
+      el.className = 'board-tag';
+      el.textContent = `${busNames(s)} 승차`;
+      const o = new kakao.maps.CustomOverlay({ position: LL(s.coords[0][1], s.coords[0][0]), content: el, yAnchor: 1.4, zIndex: 2 });
+      o.setMap(map);
+      drawn.marks.push(o);
+    }
+  }
+  if (!bounds.isEmpty()) map.setBounds(bounds, 40, 40, 40, 40);
+}
+
+const busNames = (step) => {
+  const names = [...new Set(step.vehicles.map((v) => v.name).filter(Boolean))];
+  if (!names.length) return step.type === 'SUBWAY' ? '지하철' : '버스';
+  return names.length > 3 ? `${names.slice(0, 3).join('·')} 외` : names.join('·');
+};
+
+function renderTransitResult() {
   const box = $('routeResult');
-  const route = state.route;
+  const t = state.transit;
+  if (!t) { box.innerHTML = ''; return; }
+  const parts = [];
+
+  if (!t.ranked.length) {
+    parts.push(`<p class="avoided">${esc(t.message || '버스 경로를 찾지 못했어요.')}</p>`);
+  } else {
+    const label = (x) => `${areaName(x.id)}(${x.level === 'closed' ? '통제' : t.levels[x.id]?.level.label || ''})`;
+    parts.push('<ol class="transit-list">');
+    t.ranked.forEach((r, k) => {
+      const ride = r.steps.filter((s) => s.type !== 'WALKING');
+      const chain = ride.map((s) => `<span class="busno">${esc(busNames(s))}</span>`).join('<span class="arrow">›</span>');
+      const meta = [`환승 ${r.transfers}회`, `걷기 약 ${r.walkMin + r.steps.filter((s) => s.type === 'WALKING').reduce((a, s) => a + s.minutes, 0)}분`];
+      if (r.fare) meta.push(`${r.fare.toLocaleString()}원`);
+      parts.push(`<li><button type="button" class="troute" data-k="${k}" aria-pressed="${k === t.selected}">
+        <span class="thead"><span class="ttime">${r.total}분</span>${k === 0 ? '<span class="badge">추천</span>' : ''}<span class="tmeta">${meta.join(' · ')}</span></span>
+        <span class="tchain">${chain}</span>
+        ${ride[0]?.from ? `<span class="tstops">${esc(ride[0].from)} 승차 → ${esc(ride[ride.length - 1].to || '')} 하차</span>` : ''}
+        ${r.risks.length ? `<span class="risk">지나가는 혼잡 구역: ${r.risks.map((x) => esc(label(x))).join(', ')}. 막히면 ${r.delay}분쯤 늦어질 수 있어요.</span>` : ''}
+      </button></li>`);
+    });
+    parts.push('</ol>');
+
+    const sel = t.ranked[t.selected];
+    const steps = [];
+    const firstStop = sel.steps.find((s) => s.type !== 'WALKING')?.from;
+    steps.push(`<li>${esc(firstStop || '첫 정류장')}까지 걷기<span>약 ${walkMinutes(sel.walkStartM)}분</span></li>`);
+    for (const s of sel.steps) {
+      if (s.type === 'WALKING') {
+        if (s.minutes > 0) steps.push(`<li>환승하러 걷기<span>${s.minutes}분</span></li>`);
+      } else {
+        steps.push(`<li><strong>${esc(busNames(s))}</strong> ${esc(s.from || '')} → ${esc(s.to || '')}<span>${s.stopCount ? `${s.stopCount}정류장, ` : ''}${s.minutes}분</span></li>`);
+      }
+    }
+    steps.push(`<li>내려서 도착지까지 걷기<span>약 ${walkMinutes(sel.walkEndM)}분</span></li>`);
+    parts.push(`<details class="steps" open><summary>${t.selected === 0 ? '추천 경로' : '고른 경로'} 타는 순서</summary><ol>${steps.join('')}</ol></details>`);
+
+    const straight = distanceM([t.from.lat, t.from.lng], [t.to.lat, t.to.lng]);
+    const walkOnly = walkMinutes(straight);
+    if (walkOnly <= t.ranked[0].total) {
+      parts.push(`<p class="avoided">걸어서 가면 약 ${walkOnly}분이라 걷는 게 더 빠를 수 있어요.</p>`);
+    }
+  }
+
+  parts.push(`<p class="why">버스 배차 간격과 실시간 도착 정보는 아직 반영되지 않았어요.${t.landingURL ? ` <a href="${esc(t.landingURL)}" target="_blank" rel="noopener">카카오맵에서 확인하기</a>` : ''}</p>`);
+  if (t.ymd !== state.ymd || t.hour !== state.hour) {
+    parts.push(`<p class="warn">고른 시간이 바뀌었어요. 다시 찾으면 ${state.hour}시 혼잡도로 추천 순서를 다시 정해요.</p>`);
+  }
+  box.innerHTML = parts.join('');
+  box.querySelectorAll('[data-k]').forEach((b) =>
+    b.addEventListener('click', () => {
+      t.selected = Number(b.dataset.k);
+      drawRoute();
+      renderTransitResult();
+    }),
+  );
+}
+
+function renderRouteResult() {
+  if (state.mode === 'bus') return renderTransitResult();
+  const box = $('routeResult');
+  const route = state.routes[state.mode];
   if (!route) return;
+  const car = state.mode === 'car';
+  const W = car
+    ? { smart: '덜 막히는 길', plain: '가장 빠른 길', only: '차로 가는 길', how: '차로', steps: '가는 순서 보기' }
+    : { smart: '한산한 길', plain: '가장 짧은 길', only: '걷는 길', how: '걸어서', steps: '걷는 순서 보기' };
   const { plain, smart, warning, levels, avoid } = route;
   const main = smart || plain;
   const parts = [];
 
-  parts.push(`<div class="result-main">${smart ? '한산한 길' : '걷는 길'} <span class="dist">${fmtDist(main.distanceM)} · 걸어서 ${main.minutes}분</span></div>`);
+  parts.push(`<div class="result-main">${smart ? W.smart : W.only} <span class="dist">${fmtDist(main.distanceM)} · ${W.how} ${main.minutes}분</span></div>`);
 
   if (smart) {
     const diff = smart.minutes - plain.minutes;
-    parts.push(`<div class="result-line"><span class="swatch"></span>한산한 길 ${fmtDist(smart.distanceM)}, ${smart.minutes}분</div>`);
-    parts.push(`<div class="result-line"><span class="swatch plain"></span>가장 짧은 길 ${fmtDist(plain.distanceM)}, ${plain.minutes}분${diff > 0 ? ` (한산한 길이 ${diff}분 더 걸려요)` : ''}</div>`);
+    parts.push(`<div class="result-line"><span class="swatch"></span>${W.smart} ${fmtDist(smart.distanceM)}, ${smart.minutes}분</div>`);
+    parts.push(`<div class="result-line"><span class="swatch plain"></span>${W.plain} ${fmtDist(plain.distanceM)}, ${plain.minutes}분${diff > 0 ? ` (${W.smart}이 ${diff}분 더 걸려요)` : ''}</div>`);
 
     const label = (id) => {
       const lv = levels[id]?.level.label || '통제';
@@ -454,10 +634,13 @@ function renderRouteResult() {
     const avoided = plain.passes.filter((id) => !smart.passes.includes(id) && avoid.some((a) => a.id === id));
     const still = smart.passes.filter((id) => avoid.some((a) => a.id === id));
     if (avoided.length) parts.push(`<p class="avoided">피해 가는 곳: ${avoided.map((id) => esc(label(id))).join(', ')}</p>`);
-    else if (!still.length) parts.push(`<p class="avoided">가장 짧은 길도 혼잡한 구역을 지나지 않아요.</p>`);
+    else if (!still.length) parts.push(`<p class="avoided">${W.plain}도 혼잡한 구역을 지나지 않아요.</p>`);
     if (still.length) parts.push(`<p class="avoided">출발지나 도착지가 안쪽이라 지나가는 곳: ${still.map((id) => esc(label(id))).join(', ')}</p>`);
   } else if (!avoid.length) {
-    parts.push(`<p class="avoided">이 시간엔 피할 만큼 붐비는 구역이 없어서 가장 짧은 길로 안내해요.</p>`);
+    parts.push(`<p class="avoided">이 시간엔 피할 만큼 붐비는 구역이 없어서 ${W.plain}로 안내해요.</p>`);
+  }
+  if (car) {
+    parts.push(`<p class="why">차 경로는 혼잡 구역·통제 일정만 반영해요. 실시간 도로 속도는 교통소통정보 연결 후 반영할 예정이에요. 주차장은 따로 확인해 주세요.</p>`);
   }
 
   if (warning) parts.push(`<p class="warn">${esc(warning)}</p>`);
@@ -465,7 +648,7 @@ function renderRouteResult() {
     parts.push(`<p class="warn">고른 시간이 바뀌었어요. 다시 찾으면 ${state.hour}시 혼잡도로 계산해요.</p>`);
   }
   if (main.instructions.length) {
-    parts.push(`<details class="steps"><summary>걷는 순서 보기 (${main.instructions.length}단계)</summary><ol>${main.instructions
+    parts.push(`<details class="steps"><summary>${W.steps} (${main.instructions.length}단계)</summary><ol>${main.instructions
       .map((i) => `<li>${esc(i.text)}${i.distanceM ? `<span>${fmtDist(i.distanceM)}</span>` : ''}</li>`)
       .join('')}</ol></details>`);
   }
@@ -539,6 +722,7 @@ function wire() {
   document.querySelectorAll('[data-pick]').forEach((b) => b.addEventListener('click', () => setPickMode(b.dataset.pick)));
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.pick) setPickMode(state.pick); });
   $('routeBtn').addEventListener('click', findRoute);
+  document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
   wireSearch('from');
   wireSearch('to');
 
@@ -563,7 +747,7 @@ async function boot() {
     fetch('/api/config').then((r) => r.json()).catch(() => null),
     fetch('/api/forecast').then((r) => r.json()).catch(() => null),
   ]);
-  state.config = config || { kakaoJsKey: '', hasRouteKey: false, hasForecastKey: false };
+  state.config = config || { kakaoJsKey: '', hasRouteKey: false, hasTransitKey: false, hasForecastKey: false };
   state.forecast = forecast;
   render();
   initMap();
