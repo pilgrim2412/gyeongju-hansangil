@@ -9,6 +9,7 @@ export default function handler(req, res) {
   res.status(200).json({
     kakaoJsKey: process.env.KAKAO_JS_KEY || '',
     hasRouteKey: Boolean(process.env.GRAPHHOPPER_API_KEY),
+    hasTransitKey: Boolean(process.env.KAKAO_REST_KEY),
     hasForecastKey: Boolean(process.env.DATA_GO_KR_SERVICE_KEY),
   });
 }

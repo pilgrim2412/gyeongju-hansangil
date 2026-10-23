@@ -101,6 +101,6 @@
     </main>
   </div>
 
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js" onerror="document.getElementById('mapNotice').hidden=false;document.getElementById('mapNotice').textContent='화면 코드를 불러오지 못했어요. GitHub에 api·data·lib 폴더 안의 파일이 전부 올라갔는지 확인해 주세요.'"></script>
 </body>
 </html>

@@ -1,8 +1,8 @@
 // POST /api/route
-// 도보 경로 두 개를 계산해요: 일반 경로 + 혼잡 구역을 피하는 경로
+// 걸어서·차 경로 두 개를 계산해요: 일반 경로 + 혼잡 구역을 피하는 경로
 // GraphHopper 키는 여기(서버)에만 있어서 방문자에게 보이지 않아요.
 //
-// 요청: { from: {lat,lng}, to: {lat,lng}, avoid: [{ id, level }] }
+// 요청: { from: {lat,lng}, to: {lat,lng}, profile: 'foot' | 'car', avoid: [{ id, level }] }
 //   level: 'mid' | 'high' | 'peak' | 'closed'
 
 import { ZONES } from '../data/zones.js';
@@ -12,7 +12,11 @@ import { circlePolygon, areasOnPath } from '../lib/geo.js';
 const GH_URL = 'https://graphhopper.com/api/1/route';
 
 // 구역 안의 길을 얼마나 꺼릴지 (1 = 그대로, 0에 가까울수록 피함)
-const AVOID_STRENGTH = { mid: '0.6', high: '0.2', peak: '0.08', closed: '0.05' };
+// 차는 통제 구간을 거의 못 지나가게, 사람은 붐비는 곳을 더 강하게 피하게 했어요.
+const AVOID_STRENGTH = {
+  foot: { mid: '0.6', high: '0.2', peak: '0.08', closed: '0.3' },
+  car: { mid: '0.8', high: '0.4', peak: '0.2', closed: '0.01' },
+};
 
 const AREAS = [...ZONES, ...CLOSURES];
 
@@ -67,12 +71,13 @@ export default async function handler(req, res) {
   }
 
   const { from, to, avoid = [] } = req.body || {};
+  const profile = req.body?.profile === 'car' ? 'car' : 'foot';
   if (!validPoint(from) || !validPoint(to)) {
     return res.status(400).json({ error: '출발지와 도착지 좌표가 올바르지 않아요.' });
   }
 
   const base = {
-    profile: 'foot',
+    profile,
     points: [[from.lng, from.lat], [to.lng, to.lat]],
     points_encoded: false,
     instructions: true,
@@ -84,7 +89,7 @@ export default async function handler(req, res) {
   const priority = [];
   for (const item of Array.isArray(avoid) ? avoid : []) {
     const area = AREAS.find((a) => a.id === item?.id);
-    const strength = AVOID_STRENGTH[item?.level];
+    const strength = AVOID_STRENGTH[profile][item?.level];
     if (!area || !strength) continue;
     const areaId = `z_${area.id}`;
     features.push({
