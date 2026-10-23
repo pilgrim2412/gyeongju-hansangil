@@ -1,0 +1,9 @@
+{
+  "name": "gyeongju-hansangil",
+  "private": true,
+  "type": "module",
+  "description": "경주 혼잡 구역을 피하는 도보 길찾기",
+  "scripts": {
+    "dev": "node dev-server.js"
+  }
+}
