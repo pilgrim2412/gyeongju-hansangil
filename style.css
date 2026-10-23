@@ -208,6 +208,17 @@ details.steps li span { color: var(--muted); font-size: 12px; margin-left: 4px; 
   padding: 3px 8px; border-radius: 6px; white-space: nowrap; box-shadow: 0 2px 6px rgba(28, 43, 37, 0.25);
 }
 
+/* 관광지 둘러보기 */
+.place-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.place-item {
+  background: none; border: none; padding: 4px 2px; font-size: 14px; cursor: pointer; color: var(--ink);
+  text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px;
+}
+.place-item:hover { text-decoration-color: var(--ink); }
+.place-item.has-info { font-weight: 700; }
+.spot-points { margin: 6px 0 0; padding-left: 18px; font-size: 14px; }
+.pin.place { background: #fff; color: var(--ink); border: 2px solid var(--ink); }
+
 /* ── 구역·관광지 카드 ─────────────────────── */
 .zone-card h3 { margin: 0; font-size: 18px; }
 .zone-level { display: inline-block; margin-top: 4px; padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 700; }

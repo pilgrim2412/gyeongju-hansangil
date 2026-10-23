@@ -1,10 +1,11 @@
 // 경주 한산길 — 화면 동작
 import { ZONES } from './data/zones.js';
 import { ATTRACTIONS } from './data/attractions.js';
+import { PLACES } from './data/places.js';
 import { CLOSURES } from './data/closures.js';
 import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
-import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter } from './lib/geo.js';
+import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter, areaContains } from './lib/geo.js';
 import { rankTransit, walkMinutes } from './lib/transit.js';
 
 const $ = (id) => document.getElementById(id);
@@ -33,6 +34,8 @@ const state = {
   zoneId: null,
   routes: { walk: null, car: null }, // 걸어서·차 경로 결과
   mode: 'walk', // 'walk' | 'bus' | 'car'
+  region: null, // 관광지 둘러보기에서 고른 권역
+  place: null, // 고른 관광지 { ...PLACES 항목, pos: [위도, 경도] | null, loading }
   transit: null,
 };
 
@@ -55,6 +58,7 @@ function render() {
   renderMapZones();
   renderZoneCard();
   renderRouteResult();
+  renderPlaceCard();
 }
 
 function renderWhen() {
@@ -316,12 +320,134 @@ function setMode(mode) {
 }
 
 function localMatches(q) {
-  return ATTRACTIONS.filter((a) => a.name.replace(/\s/g, '').includes(q.replace(/\s/g, ''))).map((a) => ({
+  const nq = q.replace(/\s/g, '');
+  const main = ATTRACTIONS.filter((a) => a.name.replace(/\s/g, '').includes(nq)).map((a) => ({
     name: a.name, sub: '주요 관광지', lat: a.position[0], lng: a.position[1],
+  }));
+  const more = PLACES.filter((p) => p.name.replace(/\s/g, '').includes(nq) && !attractionFor(p.name)).map((p) => ({
+    name: p.name, sub: `${p.region} · ${p.address}`, place: p,
+  }));
+  return [...main, ...more];
+}
+
+// ── 관광지 둘러보기 (경주시 관광지 158곳) ─────────────────
+const REGIONS = [...new Set(PLACES.map((p) => p.region))];
+const placePos = new Map(); // 이번 방문 동안만 기억 (카카오 정책상 파일로 저장하지 않음)
+const norm = (s) => String(s).replace(/\s|경주/g, '');
+
+function attractionFor(name) {
+  const n = norm(name);
+  return ATTRACTIONS.find((a) => norm(a.name) === n || a.name.split('·').some((part) => norm(part) === n));
+}
+
+function geocodeAddress(address) {
+  return new Promise((resolve) => {
+    if (!kakao?.maps?.services) return resolve(null);
+    new kakao.maps.services.Geocoder().addressSearch(address, (res, status) => {
+      resolve(status === kakao.maps.services.Status.OK && res[0] ? [Number(res[0].y), Number(res[0].x)] : null);
+    });
+  });
+}
+
+// 이름으로 먼저 찾고(입구 위치가 더 정확), 안 되면 주소로, 그래도 안 되면 직접 넣어둔 위치
+async function locatePlace(p) {
+  if (placePos.has(p.name)) return placePos.get(p.name);
+  let pos = null;
+  const hits = await searchPlaces(`경주 ${p.name}`, false);
+  const near = hits.find((h) => isNearGyeongju([h.lat, h.lng], 40));
+  if (near) pos = [near.lat, near.lng];
+  if (!pos) pos = await geocodeAddress(p.address);
+  if (!pos) pos = attractionFor(p.name)?.position || null;
+  placePos.set(p.name, pos);
+  return pos;
+}
+
+async function openPlace(p) {
+  state.place = { ...p, pos: null, loading: true };
+  renderPlaceCard();
+  $('placeCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  const pos = await locatePlace(p);
+  if (state.place?.name !== p.name) return; // 그사이 다른 곳을 눌렀으면 무시
+  state.place = { ...p, pos, loading: false };
+  renderPlaceCard();
+  drawPlacePin();
+  if (map && pos) map.panTo(new kakao.maps.LatLng(pos[0], pos[1]));
+}
+
+function drawPlacePin() {
+  if (!map) return;
+  drawn.placePin?.setMap(null);
+  const pos = state.place?.pos;
+  if (!pos) return;
+  const el = document.createElement('div');
+  el.className = 'pin place';
+  el.textContent = state.place.name;
+  drawn.placePin = new kakao.maps.CustomOverlay({ position: new kakao.maps.LatLng(pos[0], pos[1]), content: el, yAnchor: 1.3, zIndex: 3 });
+  drawn.placePin.setMap(map);
+}
+
+function renderBrowse() {
+  if (!state.region) state.region = REGIONS[0];
+  const tabs = $('regionTabs');
+  tabs.replaceChildren(...REGIONS.map((r) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.textContent = `${r} ${PLACES.filter((p) => p.region === r).length}`;
+    b.setAttribute('aria-pressed', String(r === state.region));
+    b.addEventListener('click', () => { state.region = r; renderBrowse(); });
+    return b;
+  }));
+  const list = $('placeList');
+  list.replaceChildren(...PLACES.filter((p) => p.region === state.region).map((p) => {
+    const li = document.createElement('li');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = attractionFor(p.name) ? 'place-item has-info' : 'place-item';
+    b.textContent = p.name;
+    b.title = p.address;
+    b.addEventListener('click', () => openPlace(p));
+    li.append(b);
+    return li;
   }));
 }
 
-function searchPlaces(q) {
+function renderPlaceCard() {
+  const card = $('placeCard');
+  const p = state.place;
+  if (!p) { card.hidden = true; return; }
+  card.hidden = false;
+  const a = attractionFor(p.name);
+  const parts = [`<h3>${esc(p.name)}</h3><p class="why">${esc(p.region)} · ${esc(p.address)}${p.phone ? ` · <a href="tel:${esc(p.phone)}">${esc(p.phone)}</a>` : ''}</p>`];
+
+  if (p.loading) parts.push('<p class="why">위치 찾는 중…</p>');
+  else if (!p.pos) parts.push('<p class="why">지도에서 위치를 찾지 못했어요. 카카오맵에서 확인해 주세요.</p>');
+  else {
+    const zone = ZONES.find((z) => areaContains(z, p.pos));
+    if (zone) {
+      const r = scoreZone(zone, state.ymd, state.hour, state.forecast);
+      parts.push(`<p><span class="zone-level ${r.level.key}">${state.hour}시 ${esc(r.level.label)}</span> <span class="why">${esc(zone.name)} 구역 안이에요.</span></p>`);
+    } else {
+      parts.push('<p class="why">혼잡 구역 밖이라 혼잡도 정보가 아직 없어요.</p>');
+    }
+  }
+  if (a) {
+    parts.push(`<p class="why">보통 ${a.stayMin}분 머물러요</p><ul class="spot-points">${a.highlights.map((h) => `<li>${esc(h)}</li>`).join('')}</ul>`);
+  }
+  const links = (a?.links || []).filter((l) => !l.url.includes('map.kakao.com'));
+  parts.push(`<div class="spot-actions">
+    ${p.pos ? '<button type="button" class="chip" data-place-go>여기로 길찾기</button>' : ''}
+    <a class="chip" href="https://map.kakao.com/link/search/${encodeURIComponent(`경주 ${p.name}`)}" target="_blank" rel="noopener">카카오맵에서 보기</a>
+    ${links.map((l) => `<a class="chip" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join('')}
+  </div>`);
+  card.innerHTML = parts.join('');
+  card.querySelector('[data-place-go]')?.addEventListener('click', () => {
+    setPlace('to', { lat: p.pos[0], lng: p.pos[1], name: p.name });
+    $('routeTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+
+function searchPlaces(q, nearbyOnly = true) {
   return new Promise((resolve) => {
     if (!kakao?.maps?.services) return resolve([]);
     const places = new kakao.maps.services.Places();
@@ -336,7 +462,9 @@ function searchPlaces(q) {
           lng: Number(d.x),
         })));
       },
-      { location: new kakao.maps.LatLng(GYEONGJU_CENTER[0], GYEONGJU_CENTER[1]), radius: 20000, size: 8 },
+      nearbyOnly
+        ? { location: new kakao.maps.LatLng(GYEONGJU_CENTER[0], GYEONGJU_CENTER[1]), radius: 20000, size: 8 }
+        : { location: new kakao.maps.LatLng(GYEONGJU_CENTER[0], GYEONGJU_CENTER[1]), size: 5 },
     );
   });
 }
@@ -363,7 +491,17 @@ function wireSearch(which) {
           .map((r, i) => `<li><button type="button" data-i="${i}">${esc(r.name)}<small>${esc(r.sub || '')}</small></button></li>`)
           .join('');
         list.querySelectorAll('[data-i]').forEach((b) =>
-          b.addEventListener('click', () => setPlace(which, results[Number(b.dataset.i)])),
+          b.addEventListener('click', async () => {
+            const r = results[Number(b.dataset.i)];
+            if (r.place) {
+              input.value = `${r.name} (위치 찾는 중…)`;
+              const pos = await locatePlace(r.place);
+              if (!pos) { input.value = r.name; alertRoute(`${r.name}의 위치를 찾지 못했어요. 다른 이름으로 검색해 주세요.`); return; }
+              setPlace(which, { name: r.name, lat: pos[0], lng: pos[1] });
+            } else {
+              setPlace(which, r);
+            }
+          }),
         );
       }
       list.hidden = false;
@@ -678,11 +816,18 @@ function renderRouteResult() {
     if (still.length) parts.push(`<p class="avoided">출발지나 도착지가 안쪽이라 지나가는 곳: ${still.map((id) => esc(label(id))).join(', ')}</p>`);
   } else if (!avoid.length) {
     parts.push(`<p class="avoided">이 시간엔 피할 만큼 붐비는 구역이 없어서 ${W.plain}로 안내해요.</p>`);
+  } else if (!route.note) {
+    const label = (id) => `${areaName(id)}(${levels[id]?.level.label || '통제'})`;
+    const still = plain.passes.filter((id) => avoid.some((a) => a.id === id));
+    parts.push(still.length
+      ? `<p class="avoided">출발지나 도착지가 안쪽이라 지나가는 곳: ${still.map((id) => esc(label(id))).join(', ')}</p>`
+      : `<p class="avoided">${W.plain}도 혼잡한 구역을 지나지 않아요.</p>`);
   }
   if (car) {
     parts.push(`<p class="why">차 경로는 혼잡 구역·통제 일정만 반영해요. 실시간 도로 속도는 교통소통정보 연결 후 반영할 예정이에요. 주차장은 따로 확인해 주세요.</p>`);
   }
 
+  if (route.note) parts.push(`<p class="avoided">${esc(route.note)}</p>`);
   if (warning) parts.push(`<p class="warn">${esc(warning)}</p>`);
   if (route.ymd !== state.ymd || route.hour !== state.hour) {
     parts.push(`<p class="warn">고른 시간이 바뀌었어요. 다시 찾으면 ${state.hour}시 혼잡도로 계산해요.</p>`);
@@ -743,6 +888,7 @@ async function initMap() {
   drawPin('from');
   drawPin('to');
   drawRoute();
+  drawPlacePin();
 }
 
 // ── 구역 그리기 도구 (주소 뒤에 ?draw) ────────────────────
@@ -842,6 +988,7 @@ function wire() {
 
 async function boot() {
   wire();
+  renderBrowse();
   render();
   const [config, forecast] = await Promise.all([
     fetch('/api/config').then((r) => r.json()).catch(() => null),
