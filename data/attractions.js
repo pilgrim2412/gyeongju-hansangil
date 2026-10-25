@@ -89,7 +89,7 @@ export const ATTRACTIONS = [
     id: 'gyeongjuworld',
     name: '경주월드',
     position: [35.8366, 129.2833],
-    zone: 'bomun',
+    zone: 'gjworld',
     stayMin: 300,
     highlights: ['놀이기구는 주말 대기가 길어요'],
     links: [

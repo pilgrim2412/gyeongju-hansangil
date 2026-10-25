@@ -104,14 +104,28 @@ export const ZONES = [
   },
   {
     id: 'bomun',
-    name: '보문관광단지·경주월드',
-    short: '보문·경주월드',
-    center: [35.8410, 129.2845],
-    radiusM: 1100,
+    name: '보문관광단지',
+    short: '보문단지',
+    // ※ 보문호·호텔 쪽을 대충 덮는 임시 원이에요. ?draw 로 다시 그려 주세요.
+    center: [35.8455, 129.2895],
+    radiusM: 700,
     season: '기본',
     pattern: {
       weekday: { morning: 1, afternoon: 2, evening: 1 },
       weekend: { morning: 2, afternoon: 3, evening: 2 },
+    },
+  },
+  {
+    id: 'gjworld',
+    name: '경주월드',
+    short: '경주월드',
+    // ※ 경주월드·엑스포공원 쪽을 대충 덮는 임시 원이에요. ?draw 로 다시 그려 주세요.
+    center: [35.8340, 129.2860],
+    radiusM: 500,
+    season: '기본',
+    pattern: {
+      weekday: { morning: 1, afternoon: 2, evening: 1 },
+      weekend: { morning: 2, afternoon: 3, evening: 1 },
     },
   },
   {
