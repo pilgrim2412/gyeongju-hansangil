@@ -180,6 +180,7 @@ function onPointClick(latLng) {
     const which = state.pick;
     setPlace(which, { lat: latLng.getLat(), lng: latLng.getLng(), name: '지도에서 고른 곳' });
     setPickMode(which); // 끄기
+    setSheet('half');
     return;
   }
   if (DRAW_MODE) return addDraftPoint(latLng.getLat(), latLng.getLng());
@@ -222,6 +223,7 @@ function zoneBadge(lat, lng) {
 }
 
 function scrollToCard(id) {
+  if (sheetSnap === 'peek') setSheet('half');
   $(id).scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -342,7 +344,7 @@ function renderZoneCard() {
     b.addEventListener('click', () => {
       const a = ATTRACTIONS.find((x) => x.id === b.dataset.goto);
       setPlace('to', { lat: a.position[0], lng: a.position[1], name: a.name });
-      $('routeTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      scrollToCard('routeTitle');
     }),
   );
 }
@@ -353,7 +355,7 @@ function selectZone(id, pan) {
   const z = zoneById(id);
   if (pan && map && z) {
     const [lat, lng] = areaCenter(z);
-    map.panTo(new kakao.maps.LatLng(lat, lng));
+    panToVisible(new kakao.maps.LatLng(lat, lng));
   }
 }
 
@@ -452,13 +454,16 @@ async function locatePlace(p) {
 async function openPlace(p, { scroll = true, knownPos = null } = {}) {
   state.place = { ...p, pos: knownPos, loading: !knownPos };
   renderPlaceCard();
-  if (scroll) $('placeCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (scroll) {
+    if (sheetSnap === 'peek') setSheet('half');
+    $('placeCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
   const pos = knownPos || (await locatePlace(p));
   if (state.place?.name !== p.name) return; // 그사이 다른 곳을 눌렀으면 무시
   state.place = { ...p, pos, loading: false };
   renderPlaceCard();
   if (!knownPos) drawPlacePin(); // 지도에 이미 표시된 관광지는 핀 생략
-  if (map && pos && !knownPos) map.panTo(new kakao.maps.LatLng(pos[0], pos[1]));
+  if (map && pos && !knownPos) panToVisible(new kakao.maps.LatLng(pos[0], pos[1]));
 }
 
 function drawPlacePin() {
@@ -532,7 +537,7 @@ function renderPlaceCard() {
   card.innerHTML = parts.join('');
   card.querySelector('[data-place-go]')?.addEventListener('click', () => {
     setPlace('to', { lat: p.pos[0], lng: p.pos[1], name: p.name });
-    $('routeTitle').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    scrollToCard('routeTitle');
   });
 }
 
@@ -617,7 +622,7 @@ function setPickMode(which) {
   }
   hint.textContent = `지도를 눌러 ${state.pick === 'from' ? '출발' : '도착'} 지점을 고르세요`;
   hint.hidden = false;
-  if (window.innerWidth < 900) $('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  setSheet('peek'); // 휴대폰: 지도를 넓게
 }
 
 function useMyLocation() {
@@ -633,7 +638,7 @@ function useMyLocation() {
         return;
       }
       setPlace('from', p);
-      if (map) map.panTo(new kakao.maps.LatLng(p.lat, p.lng));
+      if (map) panToVisible(new kakao.maps.LatLng(p.lat, p.lng));
     },
     (err) => {
       btn.textContent = '내 위치';
@@ -648,6 +653,7 @@ function useMyLocation() {
 // ── 길찾기 ───────────────────────────────────────────
 function alertRoute(msg) {
   $('routeResult').innerHTML = `<p class="error">${esc(msg)}</p>`;
+  if (sheetSnap === 'peek') setSheet('half'); // 휴대폰: 시트가 내려가 있으면 올려서 보여주기
 }
 
 async function findRoute() {
@@ -684,6 +690,7 @@ async function findPathRoute(mode) {
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
     state.routes[mode] = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid };
+    if (sheetSnap === 'full') setSheet('half');
     drawRoute();
     renderRouteResult();
     if (state.autoNav) { state.autoNav = false; startNavFromResult(); }
@@ -729,6 +736,7 @@ async function findTransit() {
       from: state.from,
       to: state.to,
     };
+    if (sheetSnap === 'full') setSheet('half');
     drawRoute();
     renderRouteResult();
     if (state.autoNav) { state.autoNav = false; startNavFromResult(); }
@@ -772,7 +780,7 @@ function drawRoute() {
     drawn.routes.push(line);
     l.path.forEach((p) => bounds.extend(p));
   }
-  if (!bounds.isEmpty()) map.setBounds(bounds, 40, 40, 40, 40);
+  fitBounds(bounds);
 }
 
 function drawTransit() {
@@ -813,7 +821,7 @@ function drawTransit() {
       drawn.marks.push(o);
     }
   }
-  if (!bounds.isEmpty()) map.setBounds(bounds, 40, 40, 40, 40);
+  fitBounds(bounds);
 }
 
 const busNames = (step) => {
@@ -1038,6 +1046,7 @@ function startNavFromResult() {
 
 async function startNav(plan) {
   closePopup();
+  setSheet('peek'); // 휴대폰: 안내 중엔 지도를 넓게
   state.nav = {
     plan,
     mode: state.mode,
@@ -1063,7 +1072,6 @@ async function startNav(plan) {
     });
   }
   updateNav();
-  if (window.innerWidth < 900) $('map').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function stopNav() {
@@ -1079,6 +1087,7 @@ function stopNav() {
   state.nav = null;
   $('navBar').hidden = true;
   renderRouteResult();
+  setSheet('half');
 }
 
 function onNavPosition(p) {
@@ -1275,7 +1284,7 @@ function drawNavOnMap() {
     } else {
       drawn.me.setPosition(ll);
     }
-    if (nav.follow) map.panTo(ll);
+    if (nav.follow) panToVisible(ll);
   }
   drawn.stepLine?.setMap(null);
   drawn.stepLine = null;
@@ -1287,6 +1296,128 @@ function drawNavOnMap() {
       drawn.stepLine.setMap(map);
     }
   }
+}
+
+// ── 휴대폰 시트 (아래에서 끌어올리는 패널) ───────────────
+let sheetSnap = 'half';
+
+// 아이폰 홈 막대 높이 (그만큼 더 올려야 제목이 안 가려짐)
+let safeProbe = null;
+function safeBottom() {
+  if (!safeProbe) {
+    safeProbe = document.createElement('div');
+    safeProbe.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:env(safe-area-inset-bottom,0px);visibility:hidden;pointer-events:none';
+    document.body.append(safeProbe);
+  }
+  return safeProbe.offsetHeight;
+}
+const isMobile = () => window.matchMedia('(max-width: 899px)').matches;
+
+function sheetOffsets() {
+  const H = $('sheet').offsetHeight;
+  return {
+    full: 0,
+    half: Math.max(0, H - Math.round(window.innerHeight * 0.5)),
+    peek: Math.max(0, H - $('sheetGrab').offsetHeight - safeBottom()), // 작게: 손잡이 + 제목만
+  };
+}
+
+function currentSheetOffset() {
+  const t = getComputedStyle($('sheet')).transform;
+  return t && t !== 'none' ? new DOMMatrix(t).m42 : 0;
+}
+
+function setSheet(name, { animate = true } = {}) {
+  sheetSnap = name;
+  const el = $('sheet');
+  if (!isMobile()) { el.style.transform = ''; el.style.transition = ''; return; }
+  const off = sheetOffsets()[name];
+  el.style.transition = animate ? '' : 'none';
+  el.style.transform = `translateY(${off}px)`;
+  el.style.setProperty('--sheet-off', `${off}px`); // 화면 밖으로 내려간 만큼 아래 여백 → 끝까지 스크롤 가능
+  el.dataset.snap = name;
+  $('sheetHandle').setAttribute('aria-label', name === 'peek' ? '패널 올리기' : '패널 내리기');
+}
+
+// 시트가 지도를 가리는 높이 (움직이는 중이어도 도착할 위치 기준)
+function sheetCover() {
+  if (!isMobile()) return 0;
+  return Math.max(0, $('sheet').offsetHeight - sheetOffsets()[sheetSnap]);
+}
+
+// 지도에서 실제로 보이는 위·아래 범위 (안내창·시트 제외, 지도 기준 px)
+function visibleMapBand() {
+  const box = $('map').getBoundingClientRect();
+  const bar = $('navBar');
+  const top = bar.hidden ? 0 : Math.max(0, bar.getBoundingClientRect().bottom - box.top + 8);
+  const bottom = Math.max(top + 80, box.height - sheetCover());
+  return { top, bottom, height: box.height };
+}
+
+function fitBounds(bounds) {
+  if (!map || bounds.isEmpty()) return;
+  const band = visibleMapBand();
+  map.setBounds(bounds, band.top + 40, 30, band.height - band.bottom + 30, 30);
+}
+
+// 보이는 부분의 가운데로 옮기기 (그냥 panTo 하면 시트 뒤에 숨을 수 있음)
+function panToVisible(ll) {
+  if (!map) return;
+  const band = visibleMapBand();
+  const dy = band.height / 2 - (band.top + band.bottom) / 2;
+  const proj = map.getProjection?.();
+  if (!proj || Math.abs(dy) < 4) return map.panTo(ll);
+  const pt = proj.pointFromCoords(ll);
+  map.panTo(proj.coordsFromPoint(new kakao.maps.Point(pt.x, pt.y + dy)));
+}
+
+function wireSheet() {
+  const el = $('sheet');
+  const grab = $('sheetGrab');
+  let drag = null;
+  grab.addEventListener('pointerdown', (e) => {
+    if (!isMobile() || e.button > 0) return;
+    drag = { y: e.clientY, start: currentSheetOffset(), moved: 0, lastY: e.clientY, lastT: e.timeStamp, vel: 0 };
+    el.style.transition = 'none';
+    grab.setPointerCapture(e.pointerId);
+  });
+  grab.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const dy = e.clientY - drag.y;
+    drag.moved = Math.max(drag.moved, Math.abs(dy));
+    const off = Math.min(sheetOffsets().peek, Math.max(0, drag.start + dy));
+    el.style.transform = `translateY(${off}px)`;
+    const dt = Math.max(1, e.timeStamp - drag.lastT);
+    drag.vel = (e.clientY - drag.lastY) / dt; // 양수 = 아래로
+    drag.lastY = e.clientY;
+    drag.lastT = e.timeStamp;
+  });
+  const end = () => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    el.style.transition = '';
+    if (d.moved < 6) { // 톡 누르기: 작게 → 반, 반 → 작게, 크게 → 반
+      setSheet(sheetSnap === 'half' ? 'peek' : 'half');
+      return;
+    }
+    const cur = currentSheetOffset();
+    const o = sheetOffsets();
+    let target;
+    if (d.vel > 0.5) target = cur < o.half ? 'half' : 'peek'; // 빠르게 내림
+    else if (d.vel < -0.5) target = cur > o.half ? 'half' : 'full'; // 빠르게 올림
+    else target = Object.entries(o).sort((a, b) => Math.abs(a[1] - cur) - Math.abs(b[1] - cur))[0][0];
+    setSheet(target);
+  };
+  grab.addEventListener('pointerup', end);
+  grab.addEventListener('pointercancel', end);
+  $('sheetHandle').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSheet(sheetSnap === 'half' ? 'peek' : 'half'); }
+    if (e.key === 'ArrowUp') setSheet(sheetSnap === 'peek' ? 'half' : 'full');
+    if (e.key === 'ArrowDown') setSheet(sheetSnap === 'full' ? 'half' : 'peek');
+  });
+  window.addEventListener('resize', () => setSheet(sheetSnap, { animate: false }));
+  setSheet('half', { animate: false });
 }
 
 // ── 지도 불러오기 ─────────────────────────────────────
@@ -1331,7 +1462,7 @@ async function initMap() {
     if (Date.now() - lastShapeClick < 300) return; // 구역 위를 누른 건 이미 처리함
     onPointClick(e.latLng);
   });
-  if (DRAW_MODE) setupDrawTool();
+  if (DRAW_MODE) { setupDrawTool(); setSheet('peek'); }
   else drawAttractionMarks();
   window.addEventListener('resize', () => map.relayout());
   render();
@@ -1441,6 +1572,7 @@ function wire() {
 }
 
 async function boot() {
+  wireSheet();
   wire();
   renderBrowse();
   render();

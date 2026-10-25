@@ -14,11 +14,6 @@
 </head>
 <body>
   <div class="app">
-    <header class="brand">
-      <h1>경주 한산길</h1>
-      <p>붐비는 시간과 장소를 보고, 피해서 걷는 길을 찾아요.</p>
-    </header>
-
     <div class="map-wrap">
       <div id="map" class="map" aria-label="경주 지도"></div>
       <div id="mapNotice" class="map-notice" hidden></div>
@@ -26,7 +21,17 @@
       <div id="navBar" class="nav-bar" hidden aria-live="polite"></div>
     </div>
 
-    <main class="panel">
+    <!-- 휴대폰에서는 아래에서 끌어올리는 시트, 넓은 화면에서는 왼쪽 패널 -->
+    <div class="sheet" id="sheet">
+    <div class="sheet-grab" id="sheetGrab">
+      <div class="sheet-handle" id="sheetHandle" role="button" tabindex="0" aria-label="패널 올리기·내리기"><span></span></div>
+      <header class="brand">
+        <h1>경주 한산길</h1>
+        <p>붐비는 시간과 장소를 보고, 피해서 걷는 길을 찾아요.</p>
+      </header>
+    </div>
+
+    <main class="panel" id="panel">
       <section class="when" aria-labelledby="whenTitle">
         <h2 id="whenTitle" class="sr-only">언제</h2>
         <div class="when-row">
@@ -108,6 +113,7 @@
         혼잡도는 데이터랩 월별 방문자, 관광지 집중률 예측, 평소 패턴을 합친 추정값이에요.
       </footer>
     </main>
+    </div>
   </div>
 
   <script type="module" src="/app.js" onerror="document.getElementById('mapNotice').hidden=false;document.getElementById('mapNotice').textContent='화면 코드를 불러오지 못했어요. GitHub에 api·data·lib 폴더 안의 파일이 전부 올라갔는지 확인해 주세요.'"></script>
