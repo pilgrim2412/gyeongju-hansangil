@@ -11,5 +11,6 @@ export default function handler(req, res) {
     hasRouteKey: Boolean(process.env.GRAPHHOPPER_API_KEY),
     hasTransitKey: Boolean(process.env.KAKAO_REST_KEY),
     hasForecastKey: Boolean(process.env.DATA_GO_KR_SERVICE_KEY),
+    hasItsKey: Boolean(process.env.ITS_API_KEY),
   });
 }

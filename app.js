@@ -5,9 +5,10 @@ import { PLACES } from './data/places.js';
 import { CLOSURES } from './data/closures.js';
 import { scoreZone, activeClosures } from './lib/congestion.js';
 import { kstNow, addDays, formatDay } from './lib/time.js';
-import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter, areaContains } from './lib/geo.js';
+import { isNearGyeongju, GYEONGJU_CENTER, distanceM, areaCenter, areaContains, areasOnPath } from './lib/geo.js';
 import { rankTransit, walkMinutes, applyArrivals, arrivalKey, firstRide, UNKNOWN_WAIT_MIN } from './lib/transit.js';
 import { planFromPath, planFromTransit, navStatus, signArrow } from './lib/nav.js';
+import { eventToClosure, speedGrade } from './lib/its.js';
 
 const $ = (id) => document.getElementById(id);
 const HOURS = Array.from({ length: 18 }, (_, i) => i + 6); // 6시 ~ 23시
@@ -21,7 +22,9 @@ const esc = (s) =>
 const clampHour = (h) => Math.min(23, Math.max(6, h));
 const fmtDist = (m) => (m < 1000 ? `${m}m` : `${(m / 1000).toFixed(1)}km`);
 const zoneById = (id) => ZONES.find((z) => z.id === id);
-const areaName = (id) => zoneById(id)?.name || CLOSURES.find((c) => c.id === id)?.title || id;
+// 통제 일정 = 직접 입력한 것(data/closures.js) + ITS 실시간 돌발상황
+const allClosures = () => [...CLOSURES, ...(state.its?.closures || [])];
+const areaName = (id) => zoneById(id)?.name || allClosures().find((c) => c.id === id)?.title || id;
 
 const start = kstNow();
 const state = {
@@ -40,6 +43,8 @@ const state = {
   transit: null,
   nav: null, // 길 안내 중일 때 상태
   autoNav: false, // 다시 찾기 후 바로 안내 이어가기
+  its: null, // ITS 돌발상황 { ok, closures, fetched, reason }
+  speeds: null, // ITS 도로 속도 { ok, roads, updated, fetched, reason }
 };
 
 let kakao = null;
@@ -121,15 +126,20 @@ function renderGrid() {
 }
 
 function renderClosures() {
-  const active = activeClosures(CLOSURES, state.ymd, state.hour);
+  const active = activeClosures(allClosures(), state.ymd, state.hour);
   const banner = $('closureBanner');
   if (!active.length) {
     banner.hidden = true;
   } else {
     banner.hidden = false;
-    banner.innerHTML = active
-      .map((c) => `<strong>${esc(c.title)}</strong>${esc(c.start.slice(11))}~${esc(c.end.slice(11))} ${esc(c.note || '')}`)
-      .join('<br/>');
+    const mine = active.filter((c) => c.source !== 'its');
+    const its = active.filter((c) => c.source === 'its');
+    const lines = mine.map((c) => `<strong>${esc(c.title)}</strong>${esc(c.start.slice(11))}~${esc(c.end.slice(11))} ${esc(c.note || '')}`);
+    if (its.length) {
+      const shown = its.slice(0, 3).map((c) => `<li><b>${esc(c.title)}</b>${c.note ? ` · ${esc(c.note)}` : ''}</li>`).join('');
+      lines.push(`<strong>실시간 돌발상황 ${its.length}건</strong><ul class="its-list">${shown}</ul>${its.length > 3 ? `<span class="its-more">외 ${its.length - 3}건은 지도에 표시돼요.</span>` : ''}`);
+    }
+    banner.innerHTML = lines.join('<br/>');
   }
 
   if (!map) return;
@@ -143,8 +153,10 @@ function renderClosures() {
       strokeStyle: 'shortdash', fillColor: COLORS.peak, fillOpacity: 0.08,
     });
     const tag = document.createElement('div');
-    tag.className = 'closure-tag';
-    tag.textContent = `통제: ${c.title}`;
+    const its = c.source === 'its';
+    tag.className = `closure-tag${its && c.level !== 'closed' ? ' soft' : ''}`;
+    tag.textContent = its ? c.title : `통제: ${c.title}`;
+    if (c.note) tag.title = c.note;
     const overlay = new kakao.maps.CustomOverlay({ position: center, content: tag, yAnchor: 2.2 });
     circle.setMap(map);
     overlay.setMap(map);
@@ -662,6 +674,58 @@ async function findRoute() {
   return state.mode === 'bus' ? findTransit() : findPathRoute(state.mode);
 }
 
+// ── ITS 실시간 정보 ─────────────────────────────────────
+async function loadEvents() {
+  if (!state.config?.hasItsKey) return;
+  try {
+    const d = await fetch('/api/events').then((r) => r.json());
+    state.its = d.ok
+      ? { ok: true, fetched: d.fetched, closures: d.events.map((e) => eventToClosure(e, d.fetched)) }
+      : { ok: false, reason: d.reason, closures: [] };
+  } catch {
+    state.its = { ok: false, reason: '돌발상황 정보를 불러오지 못했어요.', closures: [] };
+  }
+  renderClosures();
+}
+
+async function loadSpeeds() {
+  if (!state.config?.hasItsKey) return null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const d = await fetch('/api/speeds', { signal: ctrl.signal }).then((r) => r.json());
+    clearTimeout(timer);
+    state.speeds = d.ok ? d : { ok: false, reason: d.reason };
+  } catch {
+    state.speeds = { ok: false, reason: '도로 속도 정보를 불러오지 못했어요.' };
+  }
+  return state.speeds.ok ? state.speeds : null;
+}
+
+// 차 결과에 붙일 실시간 도로 속도 설명
+function liveSpeedHtml(route, main) {
+  const live = route.live;
+  if (!state.config?.hasItsKey) {
+    return '<p class="why">차 경로는 혼잡 구역·통제 일정만 반영해요. 주차장은 따로 확인해 주세요.</p>';
+  }
+  if (!live?.asked) {
+    return '<p class="why">실시간 도로 속도는 시간을 \'지금\'으로 두고 찾을 때만 반영돼요. 주차장은 따로 확인해 주세요.</p>';
+  }
+  if (!live.speeds) {
+    return `<p class="why">실시간 도로 속도를 못 받아서 혼잡 구역·통제 일정만 반영했어요.${state.speeds?.reason ? ` (${esc(state.speeds.reason)})` : ''}</p>`;
+  }
+  const at = (live.speeds.updated || live.speeds.fetched || '').slice(11, 16);
+  const roads = main.live?.roads || [];
+  if (!roads.length) {
+    return `<p class="why">지나는 도로는 실시간 속도 정보가 없어요. ITS는 국도·주요 도로 위주라 시내 작은 길은 안 잡혀요.${at ? ` (${at} 기준)` : ''}</p>`;
+  }
+  const items = roads.slice(0, 5).map((r) => {
+    const g = speedGrade(r.kmh);
+    return `<li><span class="road-grade ${g.key}">${g.label}</span>${esc(r.name)} <span class="muted">${r.kmh}km/h · ${fmtDist(r.meters)}</span></li>`;
+  }).join('');
+  return `<div class="live-roads"><div class="live-head">지나는 도로 실시간 속도${at ? ` <span class="muted">${at} 기준 · ITS</span>` : ''}</div><ul>${items}</ul></div>`;
+}
+
 // 걸어서·차: GraphHopper로 일반 경로 + 혼잡 회피 경로
 async function findPathRoute(mode) {
   if (state.config && !state.config.hasRouteKey) {
@@ -672,11 +736,19 @@ async function findPathRoute(mode) {
     .filter((z) => AVOID_KEYS.includes(levels[z.id].level.key))
     .map((z) => ({ id: z.id, level: levels[z.id].level.key }));
   for (const c of activeClosures(CLOSURES, state.ymd, state.hour)) avoid.push({ id: c.id, level: 'closed' });
+  // ITS 돌발상황(사고·공사·행사)은 차 길찾기에서만 피해요 (걷는 사람은 대부분 지나갈 수 있어서)
+  if (mode === 'car') {
+    for (const c of activeClosures(state.its?.closures || [], state.ymd, state.hour)) {
+      avoid.push({ id: c.id, level: c.level, center: c.center, radiusM: c.radiusM });
+    }
+  }
 
   const btn = $('routeBtn');
   btn.disabled = true;
   btn.textContent = '찾는 중…';
   try {
+    // 차 + '지금'이면 ITS 실시간 도로 속도도 같이 (15분마다 새로 받아요)
+    const speeds = mode === 'car' && isNowSelected() ? await loadSpeeds() : null;
     const r = await fetch('/api/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -685,11 +757,12 @@ async function findPathRoute(mode) {
         to: { lat: state.to.lat, lng: state.to.lng },
         profile: mode === 'car' ? 'car' : 'foot',
         avoid,
+        speeds: speeds ? Object.fromEntries(speeds.roads.map((r) => [r.key, r.kmh])) : undefined,
       }),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
-    state.routes[mode] = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid };
+    state.routes[mode] = { ...data, ymd: state.ymd, hour: state.hour, levels, avoid, live: mode === 'car' ? { asked: isNowSelected(), speeds } : null };
     if (sheetSnap === 'full') setSheet('half');
     drawRoute();
     renderRouteResult();
@@ -720,8 +793,21 @@ async function findTransit() {
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || `서버 오류 (${r.status})`);
     const levels = levelsAt(state.ymd, state.hour);
-    const closureIds = activeClosures(CLOSURES, state.ymd, state.hour).map((c) => c.id);
-    const ranked = rankTransit(data.routes || [], levels, closureIds);
+    const active = activeClosures(allClosures(), state.ymd, state.hour);
+    // 전면 통제만 '통제'(15분 지연), ITS 공사·사고 등은 '혼잡'(5분 지연)으로 봐요
+    const closureIds = active.filter((c) => (c.level || 'closed') === 'closed').map((c) => c.id);
+    for (const c of active) {
+      if (c.level && c.level !== 'closed') levels[c.id] = { level: { key: c.level, label: '혼잡' } };
+    }
+    // ITS 돌발상황은 서버 목록에 없어서, 버스가 지나가는지 여기서 확인
+    const itsActive = active.filter((c) => c.source === 'its');
+    const routes = (data.routes || []).map((r) => {
+      if (!itsActive.length) return r;
+      const ride = r.steps.filter((st) => st.type !== 'WALKING').flatMap((st) => st.coords);
+      const extra = areasOnPath(ride, itsActive).filter((id) => !r.passes.includes(id));
+      return extra.length ? { ...r, passes: [...r.passes, ...extra] } : r;
+    });
+    const ranked = rankTransit(routes, levels, closureIds);
     state.transit = {
       ranked,
       baseRanked: ranked,
@@ -898,7 +984,7 @@ function renderTransitResult() {
   if (!t.ranked.length) {
     parts.push(`<p class="avoided">${esc(t.message || '버스 경로를 찾지 못했어요.')}</p>`);
   } else {
-    const label = (x) => `${areaName(x.id)}(${x.level === 'closed' ? '통제' : t.levels[x.id]?.level.label || ''})`;
+    const label = (x) => (zoneById(x.id) ? `${areaName(x.id)}(${t.levels[x.id]?.level.label || ''})` : areaName(x.id));
     parts.push('<ol class="transit-list">');
     t.ranked.forEach((r, k) => {
       const ride = r.steps.filter((s) => s.type !== 'WALKING');
@@ -910,7 +996,7 @@ function renderTransitResult() {
         <span class="tchain">${chain}</span>
         ${ride[0]?.from ? `<span class="tstops">${esc(ride[0].from)} 승차 → ${esc(ride[ride.length - 1].to || '')} 하차</span>` : ''}
         ${liveLine(r)}
-        ${r.risks.length ? `<span class="risk">지나가는 혼잡 구역: ${r.risks.map((x) => esc(label(x))).join(', ')}. 막히면 ${r.delay}분쯤 늦어질 수 있어요.</span>` : ''}
+        ${r.risks.length ? `<span class="risk">지나가는 ${r.risks.some((x) => !zoneById(x.id)) ? '혼잡·통제' : '혼잡'} 구역: ${r.risks.map((x) => esc(label(x))).join(', ')}. 막히면 ${r.delay}분쯤 늦어질 수 있어요.</span>` : ''}
       </button></li>`);
     });
     parts.push('</ol>');
@@ -975,17 +1061,19 @@ function renderRouteResult() {
   const { plain, smart, warning, levels, avoid } = route;
   const main = smart || plain;
   const parts = [];
+  const mins = (r) => (car && r.live?.minutes) || r.minutes; // 차는 실시간 속도로 다시 계산한 시간
+  const liveMark = car && main.live?.minutes ? ' <span class="live-dot">실시간</span>' : '';
 
-  parts.push(`<div class="result-main">${smart ? W.smart : W.only} <span class="dist">${fmtDist(main.distanceM)} · ${W.how} ${main.minutes}분</span></div>`);
+  parts.push(`<div class="result-main">${smart ? W.smart : W.only} <span class="dist">${fmtDist(main.distanceM)} · ${W.how} ${mins(main)}분${liveMark}</span></div>`);
 
   if (smart) {
-    const diff = smart.minutes - plain.minutes;
-    parts.push(`<div class="result-line"><span class="swatch"></span>${W.smart} ${fmtDist(smart.distanceM)}, ${smart.minutes}분</div>`);
-    parts.push(`<div class="result-line"><span class="swatch plain"></span>${W.plain} ${fmtDist(plain.distanceM)}, ${plain.minutes}분${diff > 0 ? ` (${W.smart}이 ${diff}분 더 걸려요)` : ''}</div>`);
+    const diff = mins(smart) - mins(plain);
+    parts.push(`<div class="result-line"><span class="swatch"></span>${W.smart} ${fmtDist(smart.distanceM)}, ${mins(smart)}분</div>`);
+    parts.push(`<div class="result-line"><span class="swatch plain"></span>${W.plain} ${fmtDist(plain.distanceM)}, ${mins(plain)}분${diff > 0 ? ` (${W.smart}이 ${diff}분 더 걸려요)` : ''}</div>`);
 
     const label = (id) => {
-      const lv = levels[id]?.level.label || '통제';
-      return `${areaName(id)}(${lv})`;
+      if (!zoneById(id)) return areaName(id); // 통제·돌발상황은 제목에 종류가 들어 있어요
+      return `${areaName(id)}(${levels[id]?.level.label || ''})`;
     };
     const avoided = plain.passes.filter((id) => !smart.passes.includes(id) && avoid.some((a) => a.id === id));
     const still = smart.passes.filter((id) => avoid.some((a) => a.id === id));
@@ -995,15 +1083,13 @@ function renderRouteResult() {
   } else if (!avoid.length) {
     parts.push(`<p class="avoided">이 시간엔 피할 만큼 붐비는 구역이 없어서 ${W.plain}로 안내해요.</p>`);
   } else if (!route.note) {
-    const label = (id) => `${areaName(id)}(${levels[id]?.level.label || '통제'})`;
+    const label = (id) => (zoneById(id) ? `${areaName(id)}(${levels[id]?.level.label || ''})` : areaName(id));
     const still = plain.passes.filter((id) => avoid.some((a) => a.id === id));
     parts.push(still.length
       ? `<p class="avoided">출발지나 도착지가 안쪽이라 지나가는 곳: ${still.map((id) => esc(label(id))).join(', ')}</p>`
       : `<p class="avoided">${W.plain}도 혼잡한 구역을 지나지 않아요.</p>`);
   }
-  if (car) {
-    parts.push(`<p class="why">차 경로는 혼잡 구역·통제 일정만 반영해요. 실시간 도로 속도는 교통소통정보 연결 후 반영할 예정이에요. 주차장은 따로 확인해 주세요.</p>`);
-  }
+  if (car) parts.push(liveSpeedHtml(route, main));
 
   if (route.note) parts.push(`<p class="avoided">${esc(route.note)}</p>`);
   if (warning) parts.push(`<p class="warn">${esc(warning)}</p>`);
@@ -1584,6 +1670,7 @@ async function boot() {
   state.forecast = forecast;
   render();
   initMap();
+  loadEvents(); // ITS 돌발상황 (키가 있을 때만, 화면은 먼저 띄우고 나중에 붙여요)
 }
 
 boot();

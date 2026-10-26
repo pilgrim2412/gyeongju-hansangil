@@ -2,12 +2,15 @@
 // 걸어서·차 경로 두 개를 계산해요: 일반 경로 + 혼잡 구역을 피하는 경로
 // GraphHopper 키는 여기(서버)에만 있어서 방문자에게 보이지 않아요.
 //
-// 요청: { from: {lat,lng}, to: {lat,lng}, profile: 'foot' | 'car', avoid: [{ id, level }] }
+// 요청: { from: {lat,lng}, to: {lat,lng}, profile: 'foot' | 'car', avoid: [{ id, level }], speeds }
 //   level: 'mid' | 'high' | 'peak' | 'closed'
+//   ITS 돌발상황은 서버 목록에 없어서 { id: 'its_…', level, center: [위도, 경도], radiusM } 로 같이 보내요.
+//   speeds: { 도로이름: 시속km } — ITS 실시간 도로 속도 (차일 때만). 지나는 도로 이름과 맞춰서 예상 시간을 다시 계산해요.
 
 import { ZONES } from '../data/zones.js';
 import { CLOSURES } from '../data/closures.js';
-import { areaRing, areasOnPath, areaContains, distanceM } from '../lib/geo.js';
+import { areaRing, areasOnPath, areaContains, distanceM, densify } from '../lib/geo.js';
+import { roadKey, speedGrade } from '../lib/its.js';
 
 const GH_URL = 'https://graphhopper.com/api/1/route';
 
@@ -42,7 +45,24 @@ function validPoint(p) {
   );
 }
 
+// 도로 이름(street_name)을 같이 달라는 요청이 막히면 기억해 두고 빼고 요청
+let detailsBlocked = false;
+
 async function requestGraphHopper(key, body) {
+  if (detailsBlocked && body.details) {
+    const { details, ...rest } = body;
+    body = rest;
+  }
+  const r = await requestGraphHopperOnce(key, body);
+  if (!r.ok && body.details && /detail/i.test(r.message || '')) {
+    detailsBlocked = true;
+    const { details, ...rest } = body;
+    return requestGraphHopperOnce(key, rest);
+  }
+  return r;
+}
+
+async function requestGraphHopperOnce(key, body) {
   try {
     const r = await fetch(`${GH_URL}?key=${encodeURIComponent(key)}`, {
       method: 'POST',
@@ -59,9 +79,63 @@ async function requestGraphHopper(key, body) {
   }
 }
 
-function summarize(path) {
-  const coords = path.points?.coordinates || [];
+// ITS 돌발상황 구역 (요청에 같이 온 것) 확인
+function inlineArea(item) {
+  if (!/^its_\w{1,80}$/.test(item?.id || '')) return null;
+  const [lat, lng] = Array.isArray(item.center) ? item.center.map(Number) : [];
+  const r = Number(item.radiusM);
+  if (!validPoint({ lat, lng }) || !(r >= 30 && r <= 2000)) return null;
+  return { id: item.id, center: [lat, lng], radiusM: r };
+}
+
+// 지나는 도로 이름 구간: GraphHopper street_name → [{ name, meters }]
+function streetsOf(path, coords) {
+  const list = path.details?.street_name || [];
+  const out = [];
+  for (const [a, b, name] of list) {
+    let m = 0;
+    for (let i = a + 1; i <= b && i < coords.length; i++) {
+      m += distanceM([coords[i - 1][1], coords[i - 1][0]], [coords[i][1], coords[i][0]]);
+    }
+    if (m < 1) continue;
+    const last = out[out.length - 1];
+    if (last && last.name === (name || '')) last.meters += m;
+    else out.push({ name: name || '', meters: m });
+  }
+  return out;
+}
+
+// 실시간 도로 속도를 넣은 예상 시간 (속도 정보가 있는 도로만 바꾸고 나머진 GraphHopper 시간 그대로)
+function liveEstimate(summary, speeds) {
+  if (!speeds || !summary.streets?.length) return null;
+  const base = summary.distanceM / Math.max(1, summary.time / 60000); // 분당 m (GraphHopper 평균)
+  let minutes = 0;
+  const roads = new Map();
+  for (const st of summary.streets) {
+    const kmh = speeds[roadKey(st.name)];
+    if (Number.isFinite(kmh) && kmh > 0) {
+      const v = Math.max(5, kmh);
+      minutes += st.meters / ((v * 1000) / 60);
+      const r = roads.get(st.name) || { name: st.name, kmh: v, meters: 0 };
+      r.meters += st.meters;
+      roads.set(st.name, r);
+    } else {
+      minutes += st.meters / base;
+    }
+  }
+  if (!roads.size) return { minutes: null, roads: [] };
   return {
+    minutes: Math.max(1, Math.round(minutes)),
+    roads: [...roads.values()]
+      .filter((r) => r.meters >= 150) // 잠깐 스치는 도로는 빼기
+      .map((r) => ({ name: r.name, kmh: Math.round(r.kmh), meters: Math.round(r.meters), grade: speedGrade(r.kmh).key }))
+      .sort((a, b) => a.kmh - b.kmh),
+  };
+}
+
+function summarize(path, areas = AREAS, speeds = null) {
+  const coords = path.points?.coordinates || [];
+  const summary = {
     distanceM: Math.round(path.distance),
     minutes: Math.max(1, Math.round(path.time / 60000)),
     ascendM: Math.round(path.ascend || 0),
@@ -69,8 +143,14 @@ function summarize(path) {
     instructions: (path.instructions || [])
       .filter((i) => i.sign !== 5) // '경유지 도착' 안내는 빼기
       .map((i) => ({ text: i.text, distanceM: Math.round(i.distance), sign: i.sign, interval: i.interval })),
-    passes: areasOnPath(coords, AREAS),
+    passes: areasOnPath(coords, areas),
+    time: path.time,
+    streets: streetsOf(path, coords),
   };
+  summary.live = liveEstimate(summary, speeds);
+  summary.streets = summary.streets.map((x) => ({ name: x.name, meters: Math.round(x.meters) }));
+  delete summary.time;
+  return summary;
 }
 
 // ── 경유지 방식 ─────────────────────────────────────────
@@ -82,7 +162,8 @@ function summarize(path) {
 const M_PER_DEG_LAT = 111320;
 
 // 경로가 각 구역 안을 지나는 거리(미터)
-function insideMeters(coords, area) {
+function insideMeters(raw, area) {
+  const coords = densify(raw);
   let m = 0;
   for (let i = 1; i < coords.length; i++) {
     const [lng1, lat1] = coords[i - 1];
@@ -93,8 +174,9 @@ function insideMeters(coords, area) {
 }
 
 function routeCost(summary, avoidItems, profile) {
-  const speed = summary.distanceM / Math.max(1, summary.minutes); // 이 경로의 분당 이동 거리
-  let cost = summary.minutes;
+  const minutes = summary.live?.minutes || summary.minutes; // 실시간 속도가 있으면 그걸로
+  const speed = summary.distanceM / Math.max(1, minutes); // 이 경로의 분당 이동 거리
+  let cost = minutes;
   for (const { area, level } of avoidItems) {
     const m = insideMeters(summary.coords, area);
     if (m > 0) cost += (m / speed) * ((CROWD_COST[profile][level] || 1) - 1);
@@ -115,7 +197,8 @@ function stepOutside(p, nx, ny, avoidAreas) {
   return null;
 }
 
-function nearDetours(coords, targets, avoidAreas) {
+function nearDetours(raw, targets, avoidAreas) {
+  const coords = densify(raw); // 작은 구역(돌발상황 등)도 놓치지 않게 촘촘하게
   // 피할 구역 안에 있는 경로 점들 중 가장 긴 연속 구간
   const inside = coords.map(([lng, lat]) => targets.some((a) => areaContains(a, [lat, lng])));
   let best = null;
@@ -154,7 +237,7 @@ function nearDetours(coords, targets, avoidAreas) {
   return out;
 }
 
-async function detourRoute(key, base, plainSummary, avoidItems, profile, from, to) {
+async function detourRoute(key, base, plainSummary, avoidItems, profile, from, to, ctx) {
   const targets = avoidItems
     .filter((x) => plainSummary.passes.includes(x.area.id))
     .filter((x) => !areaContains(x.area, [from.lat, from.lng]) && !areaContains(x.area, [to.lat, to.lng]))
@@ -179,7 +262,7 @@ async function detourRoute(key, base, plainSummary, avoidItems, profile, from, t
   let tooFar = false;
   for (const t of tries) {
     if (!t.ok) continue;
-    const summary = summarize(t.path);
+    const summary = summarize(t.path, ctx.areas, ctx.speeds);
     if (summary.minutes > Math.max(limit, plainSummary.minutes + 2)) { tooFar = true; continue; }
     const cost = routeCost(summary, avoidItems, profile);
     if (cost < best.cost - 0.5) best = { summary, cost };
@@ -207,6 +290,16 @@ export default async function handler(req, res) {
   }
 
   const { from, to, avoid = [] } = req.body || {};
+  // 실시간 도로 속도 (차일 때만, 크기 제한)
+  let speeds = null;
+  const sp = req.body?.speeds;
+  if (req.body?.profile === 'car' && sp && typeof sp === 'object' && !Array.isArray(sp)) {
+    speeds = {};
+    for (const [k, v] of Object.entries(sp).slice(0, 400)) {
+      const n = Number(v);
+      if (k.length <= 40 && Number.isFinite(n) && n >= 0 && n <= 150) speeds[roadKey(k)] = n;
+    }
+  }
   const profile = req.body?.profile === 'car' ? 'car' : 'foot';
   if (!validPoint(from) || !validPoint(to)) {
     return res.status(400).json({ error: '출발지와 도착지 좌표가 올바르지 않아요.' });
@@ -218,14 +311,20 @@ export default async function handler(req, res) {
     points_encoded: false,
     instructions: true,
     locale: 'ko',
+    details: ['street_name'],
   };
 
   // 회피 구역 만들기 (서버에 등록된 구역 id만 사용)
   const features = [];
   const priority = [];
   const avoidItems = [];
-  for (const item of Array.isArray(avoid) ? avoid : []) {
-    const area = AREAS.find((a) => a.id === item?.id);
+  const extra = [];
+  for (const item of (Array.isArray(avoid) ? avoid : []).slice(0, 60)) {
+    let area = AREAS.find((a) => a.id === item?.id);
+    if (!area) {
+      area = inlineArea(item);
+      if (area) extra.push(area);
+    }
     const strength = AVOID_STRENGTH[profile][item?.level];
     if (!area || !strength) continue;
     avoidItems.push({ area, level: item.level });
@@ -239,10 +338,11 @@ export default async function handler(req, res) {
     priority.push({ if: `in_${areaId}`, multiply_by: strength });
   }
 
+  const ctx = { areas: [...AREAS, ...extra], speeds };
   const plain = await requestGraphHopper(key, base);
   if (!plain.ok) return res.status(502).json({ error: plain.message });
 
-  const plainSummary = summarize(plain.path);
+  const plainSummary = summarize(plain.path, ctx.areas, ctx.speeds);
   let smart = null;
   let note = null;
   let method = 'none';
@@ -257,7 +357,7 @@ export default async function handler(req, res) {
         custom_model: { priority, areas: { type: 'FeatureCollection', features } },
       });
       if (r.ok) {
-        smart = summarize(r.path);
+        smart = summarize(r.path, ctx.areas, ctx.speeds);
         method = 'custom_model';
       } else {
         customError = r.message;
@@ -266,7 +366,7 @@ export default async function handler(req, res) {
     }
     // 2순위: 경유지 방식
     if (method !== 'custom_model') {
-      const d = await detourRoute(key, base, plainSummary, avoidItems, profile, from, to);
+      const d = await detourRoute(key, base, plainSummary, avoidItems, profile, from, to, ctx);
       smart = d.smart;
       note = d.note;
       method = 'detour';
