@@ -692,7 +692,7 @@ async function loadSpeeds() {
   if (!state.config?.hasItsKey) return null;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const timer = setTimeout(() => ctrl.abort(), 12000);
     const d = await fetch('/api/speeds', { signal: ctrl.signal }).then((r) => r.json());
     clearTimeout(timer);
     state.speeds = d.ok ? d : { ok: false, reason: d.reason };
