@@ -690,6 +690,10 @@ async function loadEvents() {
 
 async function loadSpeeds() {
   if (!state.config?.hasItsKey) return null;
+  if (state.its && !state.its.ok) { // 돌발상황도 못 받았으면 ITS 연결이 안 되는 상태 → 기다리지 않기
+    state.speeds = { ok: false, reason: state.its.reason };
+    return null;
+  }
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 12000);

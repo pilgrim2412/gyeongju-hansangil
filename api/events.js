@@ -15,7 +15,7 @@ export default async function handler(req, res) {
   }
   const r = await fetchIts('eventInfo', { eventType: 'all' }, 25 * 60 * 1000);
   if (!r.ok) {
-    res.setHeader('Cache-Control', 's-maxage=300');
+    res.setHeader('Cache-Control', r.down ? 's-maxage=1800' : 's-maxage=300'); // 연결 안 되면 30분 동안 다시 안 물어봄
     return res.status(200).json({ ok: false, reason: r.reason });
   }
   const events = r.items.map(normalizeEvent).filter((e) => e && inBox(e.lat, e.lng));
