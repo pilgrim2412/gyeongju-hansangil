@@ -49,6 +49,27 @@ async function ping() {
   return { ok: true, relay: 'ncp', ...out };
 }
 
+// 보낼 양 줄이기: 우리가 쓰는 항목만 남겨요 (데이터 전송량 = API Gateway 요금)
+const KEEP = ['linkId', 'roadName', 'speed', 'travelTime', 'createdDate',
+  'eventId', 'type', 'eventType', 'eventDetailType', 'message', 'coordX', 'coordY',
+  'startDate', 'endDate', 'lanesBlockType', 'lanesBlocked'];
+function slim(text) {
+  try {
+    const p = JSON.parse(text);
+    const body = p.body || {};
+    const items = Array.isArray(body.items) ? body.items : null;
+    if (!items) return text;
+    const small = items.map((it) => {
+      const o = {};
+      for (const k of KEEP) if (it[k] !== undefined && it[k] !== null && it[k] !== '') o[k] = it[k];
+      return o;
+    });
+    return JSON.stringify({ header: p.header, body: { totalCount: body.totalCount, items: small } });
+  } catch {
+    return text; // XML 등은 그대로
+  }
+}
+
 async function main(params) {
   if (!params.token || params.t !== params.token) return { ok: false, error: '토큰이 맞지 않아요.' };
   if (params.service === 'ping') return ping();
@@ -56,7 +77,8 @@ async function main(params) {
   const t0 = Date.now();
   try {
     const r = await get(`https://${HOST}:${PORT}/${params.service}?${params.q || ''}`, 25000);
-    return { ok: true, status: r.status, ms: Date.now() - t0, text: r.text };
+    const text = slim(r.text);
+    return { ok: true, status: r.status, ms: Date.now() - t0, bytes: r.text.length, text };
   } catch (e) {
     return { ok: false, code: e.code || '', error: e.message, ms: Date.now() - t0 };
   }
